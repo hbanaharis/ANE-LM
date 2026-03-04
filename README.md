@@ -30,6 +30,36 @@ echo '{"id":"1","prompt":"Hello","max_tokens":50,"temperature":0.6}' | nc -U /tm
 ### Quantization Probes
 Tested `constexpr_lut_to_dense`, `constexpr_affine_dequantize`, and `constexpr_blockwise_shift_scale` MIL ops. All rejected by the private ANE API (`InvalidMILProgram`). The private API MIL parser only supports basic runtime ops (`const`, `conv`, `add`, `mul`). Quantized inference requires the CoreML public API path.
 
+## Motivation: MLX GPU Contention
+
+[MLX](https://github.com/ml-explore/mlx) is the standard framework for LLM inference on Apple Silicon, but it has a fundamental threading constraint: **Metal GPU operations must execute on the main thread**. All MLX compute — matrix multiplications, attention, sampling — is dispatched through a single Metal command queue bound to the main thread. This means:
+
+- You cannot run two MLX models concurrently. A second `mx.eval()` call blocks until the first completes.
+- `asyncio.to_thread()` does not help — Metal calls from a background thread will deadlock or crash.
+- Applications that need a primary chat model *and* auxiliary utility calls (classification, routing, entity extraction) must serialize all GPU work through a single lock, adding seconds of latency per request.
+
+In practice, this forces a painful tradeoff: either run utility tasks on the same GPU with a priority lock (adding 10-22s of pre-generation delay while the utility model holds the GPU), or skip utility tasks entirely.
+
+### ANE as a Parallel Accelerator
+
+The Apple Neural Engine is a separate hardware accelerator with its own memory bus and compute pipeline. It shares unified memory with the GPU but has **zero contention** — ANE and GPU operate fully independently. This makes it ideal for offloading lightweight utility inference while the GPU runs the primary model:
+
+```
+GPU (MLX)          ANE (ANE-LM daemon)
+─────────          ───────────────────
+Main chat model    Utility model (0.8B-4B)
+ ↕ PriorityLock    ↕ Unix socket (no lock needed)
+ ↕ Blocked          ↕ Concurrent
+```
+
+**Use cases for concurrent ANE inference:**
+- **Pre-generation pipeline** — prompt classification, entity extraction, search query optimization all run on ANE while the GPU prepares the chat response
+- **Post-generation tasks** — conversation tagging, topic extraction, objective tracking fire on ANE without interrupting the next user interaction
+- **Background processing** — document classification, summarization, and entity extraction run continuously on ANE with zero impact on chat latency
+- **Real-time input analysis** — classify prompts, predict required sources, and show entity chips while the user is still typing
+
+The daemon mode (`serve`) keeps the model resident on ANE, eliminating cold-start overhead and providing ~1-2s latency for utility calls that previously took 10-35s through the GPU queue.
+
 ## Supported Models
 
 - Qwen3 (dense)
