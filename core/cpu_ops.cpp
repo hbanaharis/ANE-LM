@@ -162,7 +162,7 @@ void gqa_attention(float* out, const float* q,
     if (first_span > cache_len) first_span = cache_len;
     int second_span = cache_len - first_span;
 
-    float* scores = (float*)alloca(cache_len * sizeof(float));
+    float* scores = (float*)malloc(cache_len * sizeof(float));
 
     for (int h = 0; h < n_heads; h++) {
         int kv_h = h / groups;
@@ -199,6 +199,8 @@ void gqa_attention(float* out, const float* q,
             cblas_saxpy(head_dim, sv, vh, 1, oh, 1);
         }
     }
+
+    free(scores);
 }
 
 } // namespace ane_lm

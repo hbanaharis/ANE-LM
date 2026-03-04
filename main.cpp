@@ -23,6 +23,15 @@
 extern "C" void* objc_autoreleasePoolPush(void);
 extern "C" void  objc_autoreleasePoolPop(void*);
 
+// RAII wrapper — ensures pool is popped even on ObjC exception unwind
+struct AutoreleasePool {
+    void* pool;
+    AutoreleasePool() : pool(objc_autoreleasePoolPush()) {}
+    ~AutoreleasePool() { objc_autoreleasePoolPop(pool); }
+    AutoreleasePool(const AutoreleasePool&) = delete;
+    AutoreleasePool& operator=(const AutoreleasePool&) = delete;
+};
+
 using namespace ane_lm;
 
 static volatile sig_atomic_t g_serve_stop = 0;
@@ -187,6 +196,20 @@ static int cmd_chat(LLMModel& model, Tokenizer& tokenizer, const Args& args) {
     return 0;
 }
 
+// Write all bytes to fd, retrying on partial writes and EINTR
+static bool write_all(int fd, const char* buf, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = write(fd, buf + sent, len - sent);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        sent += n;
+    }
+    return true;
+}
+
 static int cmd_serve(LLMModel& model, Tokenizer& tokenizer, const Args& args) {
     using json = nlohmann::json;
 
@@ -239,10 +262,11 @@ static int cmd_serve(LLMModel& model, Tokenizer& tokenizer, const Args& args) {
         setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &sock_tv, sizeof(sock_tv));
         setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &sock_tv, sizeof(sock_tv));
 
-        // Read request line (until \n)
+        // Read request line (until \n, max 64KB)
         std::string request_line;
         char ch;
-        while (true) {
+        constexpr size_t MAX_REQUEST_SIZE = 65536;
+        while (request_line.size() < MAX_REQUEST_SIZE) {
             ssize_t n = read(client_fd, &ch, 1);
             if (n <= 0 || ch == '\n') break;
             request_line += ch;
@@ -253,67 +277,65 @@ static int cmd_serve(LLMModel& model, Tokenizer& tokenizer, const Args& args) {
             continue;
         }
 
-        // Per-request autorelease pool
-        void* req_pool = objc_autoreleasePoolPush();
-
         json resp;
         std::string req_id;
 
-        try {
-            json req = json::parse(request_line);
-            req_id = req.value("id", "");
-            std::string prompt = req.value("prompt", "Hello");
-            int max_tokens = req.value("max_tokens", 200);
-            float temperature = req.value("temperature", 0.1f);
-            float rep_penalty = req.value("repetition_penalty", 1.0f);
+        {
+            AutoreleasePool req_pool;
 
-            // Reset model state for independent request
-            model.reset();
+            try {
+                json req = json::parse(request_line);
+                req_id = req.value("id", "");
+                std::string prompt = req.value("prompt", "Hello");
+                int max_tokens = req.value("max_tokens", 200);
+                float temperature = req.value("temperature", 0.1f);
+                float rep_penalty = req.value("repetition_penalty", 1.0f);
 
-            SamplingParams sampling;
-            sampling.temperature = temperature;
-            sampling.repetition_penalty = rep_penalty;
+                // Reset model state for independent request
+                model.reset();
 
-            std::string full_text;
-            GenerationResponse last{};
+                SamplingParams sampling;
+                sampling.temperature = temperature;
+                sampling.repetition_penalty = rep_penalty;
 
-            stream_generate(model, tokenizer, prompt,
-                max_tokens, false, sampling,
-                [&](const GenerationResponse& r) {
-                    if (r.token == -1) {
+                std::string full_text;
+                GenerationResponse last{};
+
+                stream_generate(model, tokenizer, prompt,
+                    max_tokens, false, sampling,
+                    [&](const GenerationResponse& r) {
+                        if (r.token == -1) {
+                            last = r;
+                            return;
+                        }
+                        if (!r.text.empty()) {
+                            full_text += r.text;
+                        }
                         last = r;
-                        return;
-                    }
-                    if (!r.text.empty()) {
-                        full_text += r.text;
-                    }
-                    last = r;
-                });
+                    });
 
-            resp["id"] = req_id;
-            resp["text"] = full_text;
-            resp["prompt_tokens"] = last.prompt_tokens;
-            resp["gen_tokens"] = last.generation_tokens;
-            resp["prompt_tps"] = last.prompt_tps;
-            resp["gen_tps"] = last.generation_tps;
-            resp["error"] = nullptr;
+                resp["id"] = req_id;
+                resp["text"] = full_text;
+                resp["prompt_tokens"] = last.prompt_tokens;
+                resp["gen_tokens"] = last.generation_tokens;
+                resp["prompt_tps"] = last.prompt_tps;
+                resp["gen_tps"] = last.generation_tps;
+                resp["error"] = nullptr;
 
-            fprintf(stderr, "[serve] req=%s gen=%d tokens @ %.1f t/s\n",
-                    req_id.c_str(), last.generation_tokens, last.generation_tps);
+                fprintf(stderr, "[serve] req=%s gen=%d tokens @ %.1f t/s\n",
+                        req_id.c_str(), last.generation_tokens, last.generation_tps);
 
-        } catch (const std::exception& e) {
-            resp["id"] = req_id;
-            resp["text"] = "";
-            resp["error"] = std::string(e.what());
-            fprintf(stderr, "[serve] req=%s error: %s\n", req_id.c_str(), e.what());
-        }
+            } catch (const std::exception& e) {
+                resp["id"] = req_id;
+                resp["text"] = "";
+                resp["error"] = std::string(e.what());
+                fprintf(stderr, "[serve] req=%s error: %s\n", req_id.c_str(), e.what());
+            }
+        } // ~AutoreleasePool: always pops, even on ObjC exception
 
-        objc_autoreleasePoolPop(req_pool);
-
-        // Write response (check for errors but never crash)
+        // Write response (retry partial writes, never crash)
         std::string resp_line = resp.dump() + "\n";
-        ssize_t written = write(client_fd, resp_line.c_str(), resp_line.size());
-        if (written < 0) {
+        if (!write_all(client_fd, resp_line.c_str(), resp_line.size())) {
             fprintf(stderr, "[serve] req=%s write failed: %s\n",
                     req_id.c_str(), strerror(errno));
         }

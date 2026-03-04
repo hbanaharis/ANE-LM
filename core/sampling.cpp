@@ -2,6 +2,7 @@
 #include "cpu_ops.h"
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <algorithm>
 #include <unordered_map>
 
@@ -10,7 +11,8 @@ namespace ane_lm {
 int sample_token(const float* logits, int vocab_size,
                  const SamplingParams& params,
                  const std::vector<int>& recent_tokens) {
-    float* adjusted = (float*)malloc(vocab_size * sizeof(float));
+    auto adjusted_buf = std::unique_ptr<float[]>(new float[vocab_size]);
+    float* adjusted = adjusted_buf.get();
     memcpy(adjusted, logits, vocab_size * sizeof(float));
 
     if (!recent_tokens.empty()) {
@@ -47,7 +49,6 @@ int sample_token(const float* logits, int vocab_size,
         for (int i = 1; i < vocab_size; i++) {
             if (adjusted[i] > adjusted[max_i]) max_i = i;
         }
-        free(adjusted);
         return max_i;
     }
 
@@ -59,9 +60,8 @@ int sample_token(const float* logits, int vocab_size,
     float cum = 0.0f;
     for (int i = 0; i < vocab_size; i++) {
         cum += adjusted[i];
-        if (cum >= r) { free(adjusted); return i; }
+        if (cum >= r) { return i; }
     }
-    free(adjusted);
     return vocab_size - 1;
 }
 
