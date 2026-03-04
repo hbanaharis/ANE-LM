@@ -3,3 +3,18 @@ example/
 .DS_Store
 *.dSYM/
 .idea
+
+# Model weights (large binary files)
+models/Qwen3.5-*/
+models/*.safetensors
+*.bin
+*.gguf
+
+# ANE compiled kernel cache
+compiled_markers/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

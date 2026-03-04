@@ -1,10 +1,12 @@
 #include "safetensors.h"
 #include <ane_lm/common.h>
+#include <nlohmann/json.hpp>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <fstream>
 
 namespace ane_lm {
 
@@ -380,6 +382,131 @@ int SafeTensors::write_ane_blobs(const SafeTensors& src, const std::string& outp
 
     fprintf(stderr, "Wrote %d ANE blobs to %s\n", written, output_dir.c_str());
     return written;
+}
+
+// --- SafeTensorsCollection ---
+
+SafeTensorsCollection::~SafeTensorsCollection() {
+    for (auto* sf : shards_) delete sf;
+}
+
+SafeTensorsCollection* SafeTensorsCollection::open(const std::string& model_dir) {
+    auto* coll = new SafeTensorsCollection();
+
+    // Check for multi-shard index file
+    std::string index_path = model_dir + "/model.safetensors.index.json";
+    std::ifstream idx_file(index_path);
+
+    if (idx_file.is_open()) {
+        nlohmann::json idx = nlohmann::json::parse(idx_file);
+        idx_file.close();
+
+        if (!idx.contains("weight_map")) {
+            fprintf(stderr, "Invalid index.json: missing weight_map\n");
+            delete coll;
+            return nullptr;
+        }
+        auto& weight_map = idx["weight_map"];
+
+        // Collect unique shard filenames in order
+        std::vector<std::string> shard_files;
+        std::unordered_map<std::string, int> shard_indices;
+
+        for (auto& [tensor_name, shard_file] : weight_map.items()) {
+            std::string sf_name = shard_file.get<std::string>();
+            if (shard_indices.find(sf_name) == shard_indices.end()) {
+                shard_indices[sf_name] = (int)shard_files.size();
+                shard_files.push_back(sf_name);
+            }
+            coll->tensor_to_shard_[tensor_name] = shard_indices[sf_name];
+        }
+
+        LOG("Multi-shard model: %d shards, %d tensors\n",
+            (int)shard_files.size(), (int)weight_map.size());
+
+        // Open each shard
+        for (auto& sf_name : shard_files) {
+            std::string sf_path = model_dir + "/" + sf_name;
+            SafeTensors* sf = SafeTensors::open(sf_path);
+            if (!sf) {
+                fprintf(stderr, "Failed to open shard: %s\n", sf_path.c_str());
+                delete coll;
+                return nullptr;
+            }
+            coll->shards_.push_back(sf);
+        }
+    } else {
+        // Single-file fallback (existing behavior)
+        std::string sf_path = model_dir + "/model.safetensors-00001-of-00001.safetensors";
+        SafeTensors* sf = SafeTensors::open(sf_path);
+        if (!sf) {
+            sf_path = model_dir + "/model.safetensors";
+            sf = SafeTensors::open(sf_path);
+        }
+        if (!sf) {
+            fprintf(stderr, "No safetensors found in %s\n", model_dir.c_str());
+            delete coll;
+            return nullptr;
+        }
+        coll->shards_.push_back(sf);
+        coll->build_tensor_map();
+    }
+
+    return coll;
+}
+
+void SafeTensorsCollection::build_tensor_map() {
+    for (int s = 0; s < (int)shards_.size(); s++) {
+        SafeTensors* sf = shards_[s];
+        for (int i = 0; i < sf->n_tensors(); i++) {
+            tensor_to_shard_[sf->tensor(i).name] = s;
+        }
+    }
+}
+
+SafeTensors* SafeTensorsCollection::shard_for(const char* name) const {
+    auto it = tensor_to_shard_.find(name);
+    if (it == tensor_to_shard_.end()) return nullptr;
+    return shards_[it->second];
+}
+
+const SFTensor* SafeTensorsCollection::find(const char* name) const {
+    SafeTensors* sf = shard_for(name);
+    if (!sf) return nullptr;
+    return sf->find(name);
+}
+
+float* SafeTensorsCollection::load_bf16_to_f32(const char* name, int64_t expected_numel) const {
+    SafeTensors* sf = shard_for(name);
+    if (!sf) {
+        fprintf(stderr, "Weight not found in any shard: %s\n", name);
+        return nullptr;
+    }
+    return sf->load_bf16_to_f32(name, expected_numel);
+}
+
+float* SafeTensorsCollection::load_f32_direct(const char* name, int64_t expected_numel) const {
+    SafeTensors* sf = shard_for(name);
+    if (!sf) {
+        fprintf(stderr, "Weight not found in any shard: %s\n", name);
+        return nullptr;
+    }
+    return sf->load_f32_direct(name, expected_numel);
+}
+
+float* SafeTensorsCollection::load_norm_weight(const char* name, int64_t expected_numel) const {
+    SafeTensors* sf = shard_for(name);
+    if (!sf) {
+        fprintf(stderr, "Weight not found in any shard: %s\n", name);
+        return nullptr;
+    }
+    return sf->load_norm_weight(name, expected_numel);
+}
+
+const uint16_t* SafeTensorsCollection::get_bf16_ptr(const char* name) const {
+    SafeTensors* sf = shard_for(name);
+    if (!sf) return nullptr;
+    return sf->get_bf16_ptr(name);
 }
 
 } // namespace ane_lm

@@ -77,7 +77,7 @@ private:
     int rot_dim_ = 0;
     float rope_theta_ = 0;
     float rms_eps_ = 0;
-    int lin_num_heads_ = 0;
+    int lin_num_key_heads_ = 0;
     int lin_num_val_heads_ = 0;
     int lin_key_dim_ = 0;
     int lin_val_dim_ = 0;
@@ -89,6 +89,7 @@ private:
     int full_kv_dim_ = 0;
     int full_out_dim_ = 0;
     bool attn_output_gate_ = true;
+    std::string weight_prefix_;  // e.g., "model.language_model." or "model." or ""
 
     static constexpr int MAX_SEQ_LEN = 4096;
     static constexpr int KV_CACHE_CAPACITY = 2048;
@@ -164,6 +165,7 @@ private:
     float* rope_sin_ = nullptr;
 
     void apply_args(const Qwen35Args& args);
+    bool detect_weight_prefix(ModelWeights* sf);
     bool load_weights(ModelWeights* sf);
     bool compile_ane(ModelWeights* sf, const std::string& blob_dir);
     bool compile_lm_head_ane(ModelWeights* sf, const std::string& blob_dir);

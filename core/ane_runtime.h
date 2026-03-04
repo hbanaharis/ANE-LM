@@ -57,4 +57,10 @@ bool ane_matvec(ANEKernel* k, float* output, const float* input, int in_dim, int
 void ane_free(ANEKernel* k);
 void ane_free_layer(LayerANEKernels* lk);
 
+// Quantization probe — tests whether the private ANE API accepts quantized MIL ops
+bool ane_test_quantized_compile();
+
+// LUT4 probe — tests whether constexpr_lut_to_dense compiles and runs on ANE
+bool ane_test_lut4_compile();
+
 } // namespace ane_lm

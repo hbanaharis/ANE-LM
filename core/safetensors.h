@@ -3,6 +3,8 @@
 #include <ane_lm/common.h>
 #include <cstdint>
 #include <string>
+#include <vector>
+#include <unordered_map>
 
 namespace ane_lm {
 
@@ -56,6 +58,34 @@ private:
     int n_tensors_ = 0;
 
     bool parse_header(const char* json, int64_t json_len);
+};
+
+// Multi-shard safetensors loader.
+// Handles both single-file and multi-shard models (via model.safetensors.index.json).
+class SafeTensorsCollection {
+public:
+    ~SafeTensorsCollection();
+
+    // Open from a model directory. Parses index.json for multi-shard, falls back to single-file.
+    static SafeTensorsCollection* open(const std::string& model_dir);
+
+    // Tensor lookup (delegates to the correct shard)
+    const SFTensor* find(const char* name) const;
+
+    // Load helpers (delegate to the correct shard)
+    float* load_bf16_to_f32(const char* name, int64_t expected_numel = -1) const;
+    float* load_f32_direct(const char* name, int64_t expected_numel = -1) const;
+    float* load_norm_weight(const char* name, int64_t expected_numel) const;
+    const uint16_t* get_bf16_ptr(const char* name) const;
+
+    int num_shards() const { return (int)shards_.size(); }
+
+private:
+    std::vector<SafeTensors*> shards_;
+    std::unordered_map<std::string, int> tensor_to_shard_;  // tensor name → shard index
+
+    void build_tensor_map();
+    SafeTensors* shard_for(const char* name) const;
 };
 
 } // namespace ane_lm

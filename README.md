@@ -1,6 +1,35 @@
 # ANE-LM
 
-LLM inference on Apple Neural Engine (ANE) using private `AppleNeuralEngine.framework` APIs. 
+LLM inference on Apple Neural Engine (ANE) using private `AppleNeuralEngine.framework` APIs.
+
+Fork of [johnmai-dev/ANE-LM](https://github.com/johnmai-dev/ANE-LM) with extensions for multi-shard models, asymmetric GQA, and daemon mode for concurrent utility inference.
+
+## What's New
+
+### Multi-Shard SafeTensors Loading
+Models split across multiple `.safetensors` files (e.g. `model-00001-of-00002.safetensors`) are loaded automatically via `model.safetensors.index.json`. Falls back to single-file loading if no index exists.
+
+### Weight Prefix Auto-Detection
+Automatically detects weight naming conventions (`model.language_model.`, `model.`, or bare) by probing for `embed_tokens.weight`. No manual configuration needed.
+
+### Asymmetric Key/Value Head Support
+Supports models where `num_key_heads != num_value_heads` (e.g. Qwen3.5-4B DeltaNet layers with 16 key heads and 32 value heads). Implements GQA-style key head grouping in the SSM loop.
+
+### Daemon Mode (`serve`)
+Persistent daemon process that keeps the model loaded on ANE and accepts requests over a Unix socket. Eliminates cold-start latency for repeated inference calls.
+
+```bash
+# Start daemon
+./build/ane-lm serve --model /path/to/Qwen3.5-0.8B --socket /tmp/ane.sock
+
+# Request (JSON-lines over Unix socket)
+echo '{"id":"1","prompt":"Hello","max_tokens":50,"temperature":0.6}' | nc -U /tmp/ane.sock
+# Response: {"id":"1","text":"...","gen_tokens":50,"gen_tps":27.5}
+```
+
+### Quantization Probes
+Tested `constexpr_lut_to_dense`, `constexpr_affine_dequantize`, and `constexpr_blockwise_shift_scale` MIL ops. All rejected by the private ANE API (`InvalidMILProgram`). The private API MIL parser only supports basic runtime ops (`const`, `conv`, `add`, `mul`). Quantized inference requires the CoreML public API path.
+
 ## Supported Models
 
 - Qwen3 (dense)
@@ -17,7 +46,7 @@ cmake --build build
 
 ![image](assets/image.png)
 
-Download a supported model (e.g. `Qwen3-0.6B` or `Qwen3.5-0.8B` in safetensors format), then:
+Download a supported model (e.g. `Qwen3-0.6B` or `Qwen3.5-0.8B` in BF16 safetensors format), then:
 
 ```bash
 # Single-shot generation
@@ -28,6 +57,9 @@ Download a supported model (e.g. `Qwen3-0.6B` or `Qwen3.5-0.8B` in safetensors f
 
 # Pre-convert weights (BF16 -> FP16, speeds up subsequent loads)
 ./build/ane-lm convert --model /path/to/Qwen3.5-0.8B
+
+# Persistent daemon
+./build/ane-lm serve --model /path/to/Qwen3.5-0.8B --socket /tmp/ane.sock
 ```
 
 ### Options
@@ -40,8 +72,18 @@ Download a supported model (e.g. `Qwen3-0.6B` or `Qwen3.5-0.8B` in safetensors f
 --repeat-penalty P   Repetition penalty (default: 1.2, 1.0=off)
 --enable-thinking    Enable thinking/reasoning mode
 --no-ane-cache       Disable persistent ANE compile cache
+--socket <path>      Unix socket path (serve mode)
 -v, --verbose        Show detailed initialization info
 ```
+
+### Performance
+
+| Model | Size | tok/s | Init (cached) |
+|-------|------|-------|---------------|
+| Qwen3.5-0.8B | 1.7 GB | 27 | 1.9s |
+| Qwen3.5-4B | 9.3 GB | 8.9 | 8.4s |
+
+ANE runs FP16-only (no quantization in private API). Throughput scales with model compute. The ANE operates independently from the GPU, enabling concurrent inference with GPU-based models (e.g. MLX).
 
 ## Requirements
 
@@ -50,5 +92,10 @@ Download a supported model (e.g. `Qwen3-0.6B` or `Qwen3.5-0.8B` in safetensors f
 
 ## Acknowledgments
 
+- [johnmai-dev/ANE-LM](https://github.com/johnmai-dev/ANE-LM) - Original project: LLM inference on Apple Neural Engine via private APIs
 - [maderix/ANE](https://github.com/maderix/ANE) - Training neural networks on Apple Neural Engine via reverse-engineered private APIs
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) - LLM inference in C/C++
+
+## License
+
+MIT License - see [LICENSE](LICENSE) for details.

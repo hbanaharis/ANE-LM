@@ -849,4 +849,651 @@ ANEKernel* ane_compile_fused_ffn_blob(const std::string& gate_path, const std::s
     return r;
 }
 
+// ============ Quantization probe ============
+
+// Build a raw weight blob (128-byte header + data)
+static id build_weight_blob_raw(const void* data, size_t data_bytes) {
+    size_t total = 128 + data_bytes;
+    uint8_t* buf = (uint8_t*)calloc(total, 1);
+    buf[0] = 0x01; buf[4] = 0x02;
+    uint8_t* chunk = buf + 64;
+    chunk[0] = 0xEF; chunk[1] = 0xBE; chunk[2] = 0xAD; chunk[3] = 0xDE;
+    chunk[4] = 0x01;
+    *(uint32_t*)(chunk + 8) = (uint32_t)data_bytes;
+    *(uint32_t*)(chunk + 16) = 128;
+    memcpy(buf + 128, data, data_bytes);
+    return ns_data_nocopy(buf, total);
+}
+
+// MIL with constexpr_affine_dequantize (INT8 per-channel, ios16)
+static id mil_gen_matmul_int8_affine(int out_dim, int in_dim) {
+    char buf[8192];
+    int n = snprintf(buf, sizeof(buf),
+        MIL_HEADER
+        "    func main<ios16>(tensor<fp16, [1, %d, 1, %d]> x) {\n"
+        "        tensor<uint8, [%d, %d, 1, 1]> Wq = const()"
+        "[name = tensor<string, []>(\"Wq\"), "
+        "val = tensor<uint8, [%d, %d, 1, 1]>(BLOBFILE("
+        "path = tensor<string, []>(\"@model_path/weights/wq.bin\"), "
+        "offset = tensor<uint64, []>(64)))];\n"
+        "        tensor<fp16, [%d]> Ws = const()"
+        "[name = tensor<string, []>(\"Ws\"), "
+        "val = tensor<fp16, [%d]>(BLOBFILE("
+        "path = tensor<string, []>(\"@model_path/weights/ws.bin\"), "
+        "offset = tensor<uint64, []>(64)))];\n"
+        "        tensor<uint8, [%d]> Wz = const()"
+        "[name = tensor<string, []>(\"Wz\"), "
+        "val = tensor<uint8, [%d]>(BLOBFILE("
+        "path = tensor<string, []>(\"@model_path/weights/wz.bin\"), "
+        "offset = tensor<uint64, []>(64)))];\n"
+        "        tensor<int32, []> Wa = const()"
+        "[name = tensor<string, []>(\"Wa\"), "
+        "val = tensor<int32, []>(0)];\n"
+        "        tensor<fp16, [%d, %d, 1, 1]> W = constexpr_affine_dequantize("
+        "quantized_data = Wq, zero_point = Wz, scale = Ws, axis = Wa)"
+        "[name = tensor<string, []>(\"Wd\")];\n"
+        "        tensor<string, []> pt = const()[name = tensor<string, []>(\"pt\"), val = tensor<string, []>(\"valid\")];\n"
+        "        tensor<int32, [2]> st = const()[name = tensor<string, []>(\"st\"), val = tensor<int32, [2]>([1, 1])];\n"
+        "        tensor<int32, [4]> pd = const()[name = tensor<string, []>(\"pd\"), val = tensor<int32, [4]>([0, 0, 0, 0])];\n"
+        "        tensor<int32, [2]> dl = const()[name = tensor<string, []>(\"dl\"), val = tensor<int32, [2]>([1, 1])];\n"
+        "        tensor<int32, []> gr = const()[name = tensor<string, []>(\"gr\"), val = tensor<int32, []>(1)];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> y = conv(dilations = dl, groups = gr, "
+        "pad = pd, pad_type = pt, strides = st, weight = W, x = x)"
+        "[name = tensor<string, []>(\"cv\")];\n"
+        "    } -> (y);\n"
+        "}\n",
+        in_dim, SP,
+        out_dim, in_dim, out_dim, in_dim,
+        out_dim, out_dim,
+        out_dim, out_dim,
+        out_dim, in_dim,
+        out_dim, SP);
+    return ns_data(buf, n);
+}
+
+// MIL with constexpr_blockwise_shift_scale (INT8 per-block, ios18)
+static id mil_gen_matmul_int8_blockwise(int out_dim, int in_dim, int block_size) {
+    int num_blocks = in_dim / block_size;
+    char buf[8192];
+    int n = snprintf(buf, sizeof(buf),
+        MIL_HEADER
+        "    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x) {\n"
+        "        tensor<int8, [%d, %d, 1, 1]> Wd = const()"
+        "[name = tensor<string, []>(\"Wd\"), "
+        "val = tensor<int8, [%d, %d, 1, 1]>(BLOBFILE("
+        "path = tensor<string, []>(\"@model_path/weights/wd.bin\"), "
+        "offset = tensor<uint64, []>(64)))];\n"
+        "        tensor<fp16, [%d, %d, 1, 1]> Ws = const()"
+        "[name = tensor<string, []>(\"Ws\"), "
+        "val = tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE("
+        "path = tensor<string, []>(\"@model_path/weights/ws.bin\"), "
+        "offset = tensor<uint64, []>(64)))];\n"
+        "        tensor<fp16, [%d, %d, 1, 1]> W = constexpr_blockwise_shift_scale("
+        "data = Wd, scale = Ws)"
+        "[name = tensor<string, []>(\"Wf\")];\n"
+        "        tensor<string, []> pt = const()[name = tensor<string, []>(\"pt\"), val = tensor<string, []>(\"valid\")];\n"
+        "        tensor<int32, [2]> st = const()[name = tensor<string, []>(\"st\"), val = tensor<int32, [2]>([1, 1])];\n"
+        "        tensor<int32, [4]> pd = const()[name = tensor<string, []>(\"pd\"), val = tensor<int32, [4]>([0, 0, 0, 0])];\n"
+        "        tensor<int32, [2]> dl = const()[name = tensor<string, []>(\"dl\"), val = tensor<int32, [2]>([1, 1])];\n"
+        "        tensor<int32, []> gr = const()[name = tensor<string, []>(\"gr\"), val = tensor<int32, []>(1)];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> y = conv(dilations = dl, groups = gr, "
+        "pad = pd, pad_type = pt, strides = st, weight = W, x = x)"
+        "[name = tensor<string, []>(\"cv\")];\n"
+        "    } -> (y);\n"
+        "}\n",
+        in_dim, SP,
+        out_dim, in_dim, out_dim, in_dim,
+        out_dim, num_blocks, out_dim, num_blocks,
+        out_dim, in_dim,
+        out_dim, SP);
+    return ns_data(buf, n);
+}
+
+// MIL with constexpr_lut_to_dense (4-bit LUT palettization, ios16)
+static id mil_gen_matmul_lut4(int out_dim, int in_dim) {
+    int idx_bytes = out_dim * in_dim / 2;  // 4-bit packed: 2 indices per byte
+    char buf[8192];
+    int n = snprintf(buf, sizeof(buf),
+        MIL_HEADER
+        "    func main<ios16>(tensor<fp16, [1, %d, 1, %d]> x) {\n"
+        // indices: packed uint8 blob
+        "        tensor<uint8, [%d]> Widx = const()"
+        "[name = tensor<string, []>(\"Widx\"), "
+        "val = tensor<uint8, [%d]>(BLOBFILE("
+        "path = tensor<string, []>(\"@model_path/weights/idx.bin\"), "
+        "offset = tensor<uint64, []>(64)))];\n"
+        // lut: 16 fp16 centroids
+        "        tensor<fp16, [16]> Wlut = const()"
+        "[name = tensor<string, []>(\"Wlut\"), "
+        "val = tensor<fp16, [16]>(BLOBFILE("
+        "path = tensor<string, []>(\"@model_path/weights/lut.bin\"), "
+        "offset = tensor<uint64, []>(64)))];\n"
+        // shape: [out_dim, in_dim, 1, 1]
+        "        tensor<uint32, [4]> Wshp = const()"
+        "[name = tensor<string, []>(\"Wshp\"), "
+        "val = tensor<uint32, [4]>([%d, %d, 1, 1])];\n"
+        // constexpr_lut_to_dense -> dense fp16 weight
+        "        tensor<fp16, [%d, %d, 1, 1]> W = constexpr_lut_to_dense("
+        "indices = Widx, lut = Wlut, shape = Wshp)"
+        "[name = tensor<string, []>(\"Wd\")];\n"
+        // standard conv ops
+        "        tensor<string, []> pt = const()[name = tensor<string, []>(\"pt\"), val = tensor<string, []>(\"valid\")];\n"
+        "        tensor<int32, [2]> st = const()[name = tensor<string, []>(\"st\"), val = tensor<int32, [2]>([1, 1])];\n"
+        "        tensor<int32, [4]> pd = const()[name = tensor<string, []>(\"pd\"), val = tensor<int32, [4]>([0, 0, 0, 0])];\n"
+        "        tensor<int32, [2]> dl = const()[name = tensor<string, []>(\"dl\"), val = tensor<int32, [2]>([1, 1])];\n"
+        "        tensor<int32, []> gr = const()[name = tensor<string, []>(\"gr\"), val = tensor<int32, []>(1)];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> y = conv(dilations = dl, groups = gr, "
+        "pad = pd, pad_type = pt, strides = st, weight = W, x = x)"
+        "[name = tensor<string, []>(\"cv\")];\n"
+        "    } -> (y);\n"
+        "}\n",
+        in_dim, SP,
+        idx_bytes, idx_bytes,
+        out_dim, in_dim,
+        out_dim, in_dim,
+        out_dim, SP);
+    return ns_data(buf, n);
+}
+
+bool ane_test_lut4_compile() {
+    ane_init();
+    if (!ane_available()) {
+        fprintf(stderr, "ANE not available\n");
+        return false;
+    }
+
+    bool prev_cache = g_ane_persist_cache;
+    g_ane_persist_cache = false;
+
+    const int DIM = 128;
+    const int NUM_PALETTES = 16;  // 4-bit = 2^4
+
+    fprintf(stderr, "\n=== ANE LUT4 Palettization Probe (dim=%d) ===\n\n", DIM);
+
+    // Step 1: Create random FP32 weights (typical LLM range)
+    float* f32_orig = (float*)malloc(DIM * DIM * sizeof(float));
+    srand48(42);
+    for (int i = 0; i < DIM * DIM; i++) {
+        f32_orig[i] = (float)(drand48() * 0.2 - 0.1);
+    }
+
+    // Step 2: K-means quantization (trivial: uniform 16 centroids from min to max)
+    float wmin = f32_orig[0], wmax = f32_orig[0];
+    for (int i = 1; i < DIM * DIM; i++) {
+        if (f32_orig[i] < wmin) wmin = f32_orig[i];
+        if (f32_orig[i] > wmax) wmax = f32_orig[i];
+    }
+
+    // Create 16 uniformly spaced centroids
+    float centroids[NUM_PALETTES];
+    for (int i = 0; i < NUM_PALETTES; i++) {
+        centroids[i] = wmin + (wmax - wmin) * i / (NUM_PALETTES - 1);
+    }
+
+    // Assign each weight to nearest centroid, pack into 4-bit indices (LSB-first)
+    int idx_bytes = DIM * DIM / 2;
+    uint8_t* packed_idx = (uint8_t*)calloc(idx_bytes, 1);
+    for (int i = 0; i < DIM * DIM; i += 2) {
+        // Find nearest centroid for element i and i+1
+        int best0 = 0, best1 = 0;
+        float dist0 = fabsf(f32_orig[i] - centroids[0]);
+        float dist1 = fabsf(f32_orig[i + 1] - centroids[0]);
+        for (int c = 1; c < NUM_PALETTES; c++) {
+            float d0 = fabsf(f32_orig[i] - centroids[c]);
+            float d1 = fabsf(f32_orig[i + 1] - centroids[c]);
+            if (d0 < dist0) { dist0 = d0; best0 = c; }
+            if (d1 < dist1) { dist1 = d1; best1 = c; }
+        }
+        // LSB-first: lower nibble = first index, upper nibble = second index
+        packed_idx[i / 2] = (uint8_t)((best1 << 4) | best0);
+    }
+
+    // Create FP16 LUT
+    uint16_t lut_fp16[NUM_PALETTES];
+    for (int i = 0; i < NUM_PALETTES; i++) {
+        lut_fp16[i] = f32_to_f16(centroids[i]);
+    }
+
+    // Step 3: Build FP16 reference (original weights converted to FP16)
+    uint16_t* fp16_orig = (uint16_t*)malloc(DIM * DIM * sizeof(uint16_t));
+    for (int i = 0; i < DIM * DIM; i++) {
+        fp16_orig[i] = f32_to_f16(f32_orig[i]);
+    }
+
+    // --- Test A: FP16 baseline (for comparison) ---
+    ANEKernel* k_fp16 = nullptr;
+    {
+        fprintf(stderr, "Test A: FP16 baseline... ");
+        void* pool = objc_autoreleasePoolPush();
+        id wdict = build_weight_dict_1(fp16_orig, DIM * DIM, "weight");
+        id mil = mil_gen_matmul(DIM, DIM);
+        size_t in_bytes = (size_t)DIM * SP * sizeof(uint16_t);
+        size_t out_bytes = (size_t)DIM * SP * sizeof(uint16_t);
+        k_fp16 = ane_compile_raw(mil, wdict, 1, &in_bytes, 1, &out_bytes);
+        objc_autoreleasePoolPop(pool);
+        fprintf(stderr, "%s\n", k_fp16 ? "OK" : "FAILED");
+    }
+
+    // --- Test B: constexpr_lut_to_dense (4-bit LUT) ---
+    ANEKernel* k_lut4 = nullptr;
+    {
+        fprintf(stderr, "Test B: constexpr_lut_to_dense LUT4 (ios16)... ");
+        void* pool = objc_autoreleasePoolPush();
+
+        id b_idx = build_weight_blob_raw(packed_idx, idx_bytes);
+        id b_lut = build_weight_blob_raw(lut_fp16, NUM_PALETTES * sizeof(uint16_t));
+
+        id keys[] = {
+            ns_str("@model_path/weights/idx.bin"),
+            ns_str("@model_path/weights/lut.bin")
+        };
+        id values[] = { ns_weight_entry(b_idx), ns_weight_entry(b_lut) };
+        id wdict = ns_dict(keys, values, 2);
+
+        id mil = mil_gen_matmul_lut4(DIM, DIM);
+        size_t in_bytes = (size_t)DIM * SP * sizeof(uint16_t);
+        size_t out_bytes = (size_t)DIM * SP * sizeof(uint16_t);
+        k_lut4 = ane_compile_raw(mil, wdict, 1, &in_bytes, 1, &out_bytes);
+        objc_autoreleasePoolPop(pool);
+
+        if (k_lut4) {
+            fprintf(stderr, "OK (compiled!)\n");
+        } else {
+            fprintf(stderr, "FAILED (compile rejected)\n");
+            fprintf(stderr, "\n*** constexpr_lut_to_dense NOT supported by private API ***\n");
+            fprintf(stderr, "*** Fallback: CoreML public API path required ***\n");
+        }
+    }
+
+    // --- Comparison: run both kernels if both compiled ---
+    if (k_fp16 && k_lut4) {
+        float input[DIM];
+        for (int i = 0; i < DIM; i++) input[i] = 1.0f;
+
+        float out_fp16[DIM], out_lut4[DIM];
+        bool ok1 = ane_matvec(k_fp16, out_fp16, input, DIM, DIM);
+        bool ok2 = ane_matvec(k_lut4, out_lut4, input, DIM, DIM);
+
+        if (ok1 && ok2) {
+            // Error metrics
+            float max_err = 0, sum_sq_err = 0, sum_sq_orig = 0;
+            for (int i = 0; i < DIM; i++) {
+                float err = fabsf(out_fp16[i] - out_lut4[i]);
+                if (err > max_err) max_err = err;
+                sum_sq_err += err * err;
+                sum_sq_orig += out_fp16[i] * out_fp16[i];
+            }
+            float rmse = sqrtf(sum_sq_err / DIM);
+            float nrmse = (sum_sq_orig > 0) ? sqrtf(sum_sq_err / sum_sq_orig) : 0;
+
+            fprintf(stderr, "\n  Error (FP16 vs LUT4):\n");
+            fprintf(stderr, "    Max abs error:   %.6f\n", max_err);
+            fprintf(stderr, "    RMSE:            %.6f\n", rmse);
+            fprintf(stderr, "    Normalized RMSE: %.4f%%\n", nrmse * 100.0f);
+
+            fprintf(stderr, "    Sample outputs (first 4):\n");
+            for (int i = 0; i < 4; i++) {
+                fprintf(stderr, "      [%d] fp16=%.6f  lut4=%.6f  diff=%.6f\n",
+                        i, out_fp16[i], out_lut4[i], out_fp16[i] - out_lut4[i]);
+            }
+
+            // Storage comparison
+            size_t fp16_bytes = (size_t)DIM * DIM * 2;
+            size_t lut4_bytes = (size_t)idx_bytes + NUM_PALETTES * 2;
+            fprintf(stderr, "    Storage: FP16=%zu bytes, LUT4=%zu bytes (%.1f%% of FP16)\n",
+                    fp16_bytes, lut4_bytes, (float)lut4_bytes / fp16_bytes * 100.0f);
+
+            // Throughput benchmark
+            const int BENCH_ITERS = 5000;
+            for (int i = 0; i < 50; i++) {
+                ane_matvec(k_fp16, out_fp16, input, DIM, DIM);
+                ane_matvec(k_lut4, out_lut4, input, DIM, DIM);
+            }
+
+            Timer t1;
+            for (int i = 0; i < BENCH_ITERS; i++) {
+                ane_matvec(k_fp16, out_fp16, input, DIM, DIM);
+            }
+            double ms_fp16 = t1.elapsed_ms();
+
+            Timer t2;
+            for (int i = 0; i < BENCH_ITERS; i++) {
+                ane_matvec(k_lut4, out_lut4, input, DIM, DIM);
+            }
+            double ms_lut4 = t2.elapsed_ms();
+
+            double tps_fp16 = BENCH_ITERS / (ms_fp16 / 1000.0);
+            double tps_lut4 = BENCH_ITERS / (ms_lut4 / 1000.0);
+            fprintf(stderr, "\n  Throughput (%d iters, dim=%d):\n", BENCH_ITERS, DIM);
+            fprintf(stderr, "    FP16:  %.1f calls/s (%.3f ms)\n", tps_fp16, ms_fp16);
+            fprintf(stderr, "    LUT4:  %.1f calls/s (%.3f ms)\n", tps_lut4, ms_lut4);
+            fprintf(stderr, "    Ratio: %.4fx\n", tps_lut4 / tps_fp16);
+        } else {
+            fprintf(stderr, "  Eval FAILED (fp16=%s, lut4=%s)\n",
+                    ok1 ? "ok" : "fail", ok2 ? "ok" : "fail");
+        }
+    }
+
+    fprintf(stderr, "\n=== LUT4 probe complete ===\n");
+
+    if (k_fp16) ane_free(k_fp16);
+    if (k_lut4) ane_free(k_lut4);
+    free(f32_orig); free(fp16_orig); free(packed_idx);
+    g_ane_persist_cache = prev_cache;
+    return k_lut4 != nullptr;
+}
+
+bool ane_test_quantized_compile() {
+    ane_init();
+    if (!ane_available()) {
+        fprintf(stderr, "ANE not available\n");
+        return false;
+    }
+
+    // Disable cache for testing
+    bool prev_cache = g_ane_persist_cache;
+    g_ane_persist_cache = false;
+
+    const int DIM = 128;
+    const int BLOCK_SIZE = 32;
+
+    // Create test data: random INT8 weights, scales, zero points
+    uint8_t* quant_w = (uint8_t*)malloc(DIM * DIM);
+    uint16_t* scales = (uint16_t*)malloc(DIM * sizeof(uint16_t));
+    uint8_t* zero_pts = (uint8_t*)malloc(DIM);
+    int8_t* signed_w = (int8_t*)malloc(DIM * DIM);
+    uint16_t* block_scales = (uint16_t*)malloc(DIM * (DIM / BLOCK_SIZE) * sizeof(uint16_t));
+
+    srand48(42);
+    for (int i = 0; i < DIM * DIM; i++) {
+        quant_w[i] = (uint8_t)(drand48() * 255);
+        signed_w[i] = (int8_t)(drand48() * 255 - 128);
+    }
+    for (int i = 0; i < DIM; i++) {
+        scales[i] = f32_to_f16(0.01f);
+        zero_pts[i] = 128;
+    }
+    for (int i = 0; i < DIM * (DIM / BLOCK_SIZE); i++) {
+        block_scales[i] = f32_to_f16(0.01f);
+    }
+
+    // Also create FP16 reference weights for baseline comparison
+    uint16_t* fp16_w = (uint16_t*)malloc(DIM * DIM * sizeof(uint16_t));
+    for (int i = 0; i < DIM * DIM; i++) {
+        fp16_w[i] = f32_to_f16((float)(quant_w[i] - 128) * 0.01f);
+    }
+
+    fprintf(stderr, "\n=== ANE Quantization Probe (dim=%d) ===\n\n", DIM);
+
+    // --- Test 1: Baseline FP16 (should always work) ---
+    {
+        fprintf(stderr, "Test 1: FP16 baseline (ios16)... ");
+        void* pool = objc_autoreleasePoolPush();
+        id wdict = build_weight_dict_1(fp16_w, DIM * DIM, "weight");
+        id mil = mil_gen_matmul(DIM, DIM);
+        size_t in_bytes = (size_t)DIM * SP * sizeof(uint16_t);
+        size_t out_bytes = (size_t)DIM * SP * sizeof(uint16_t);
+        ANEKernel* k = ane_compile_raw(mil, wdict, 1, &in_bytes, 1, &out_bytes);
+        objc_autoreleasePoolPop(pool);
+        if (k) {
+            fprintf(stderr, "OK (compiled)\n");
+            ane_free(k);
+        } else {
+            fprintf(stderr, "FAILED\n");
+        }
+    }
+
+    // --- Test 2: constexpr_affine_dequantize (INT8, ios16) ---
+    {
+        fprintf(stderr, "Test 2: constexpr_affine_dequantize INT8 (ios16)... ");
+        void* pool = objc_autoreleasePoolPush();
+
+        id bq = build_weight_blob_raw(quant_w, DIM * DIM);
+        id bs = build_weight_blob_raw(scales, DIM * sizeof(uint16_t));
+        id bz = build_weight_blob_raw(zero_pts, DIM);
+
+        id keys[] = {
+            ns_str("@model_path/weights/wq.bin"),
+            ns_str("@model_path/weights/ws.bin"),
+            ns_str("@model_path/weights/wz.bin")
+        };
+        id values[] = { ns_weight_entry(bq), ns_weight_entry(bs), ns_weight_entry(bz) };
+        id wdict = ns_dict(keys, values, 3);
+
+        id mil = mil_gen_matmul_int8_affine(DIM, DIM);
+        size_t in_bytes = (size_t)DIM * SP * sizeof(uint16_t);
+        size_t out_bytes = (size_t)DIM * SP * sizeof(uint16_t);
+        ANEKernel* k = ane_compile_raw(mil, wdict, 1, &in_bytes, 1, &out_bytes);
+        objc_autoreleasePoolPop(pool);
+        if (k) {
+            fprintf(stderr, "OK (compiled)\n");
+
+            // Validate: run with a simple input
+            float input[DIM], output[DIM];
+            for (int i = 0; i < DIM; i++) input[i] = 1.0f;
+            if (ane_matvec(k, output, input, DIM, DIM)) {
+                float sum = 0;
+                for (int i = 0; i < DIM; i++) sum += output[i];
+                fprintf(stderr, "  -> Eval OK, output sum = %.4f\n", sum);
+            } else {
+                fprintf(stderr, "  -> Eval FAILED\n");
+            }
+            ane_free(k);
+        } else {
+            fprintf(stderr, "FAILED (compile rejected)\n");
+        }
+    }
+
+    // --- Test 3: constexpr_blockwise_shift_scale (INT8 per-block, ios18) ---
+    {
+        fprintf(stderr, "Test 3: constexpr_blockwise_shift_scale INT8 block=%d (ios18)... ", BLOCK_SIZE);
+        void* pool = objc_autoreleasePoolPush();
+
+        id bd = build_weight_blob_raw(signed_w, DIM * DIM);
+        id bs = build_weight_blob_raw(block_scales, DIM * (DIM / BLOCK_SIZE) * sizeof(uint16_t));
+
+        id keys[] = {
+            ns_str("@model_path/weights/wd.bin"),
+            ns_str("@model_path/weights/ws.bin")
+        };
+        id values[] = { ns_weight_entry(bd), ns_weight_entry(bs) };
+        id wdict = ns_dict(keys, values, 2);
+
+        id mil = mil_gen_matmul_int8_blockwise(DIM, DIM, BLOCK_SIZE);
+        size_t in_bytes = (size_t)DIM * SP * sizeof(uint16_t);
+        size_t out_bytes = (size_t)DIM * SP * sizeof(uint16_t);
+        ANEKernel* k = ane_compile_raw(mil, wdict, 1, &in_bytes, 1, &out_bytes);
+        objc_autoreleasePoolPop(pool);
+        if (k) {
+            fprintf(stderr, "OK (compiled)\n");
+            float input[DIM], output[DIM];
+            for (int i = 0; i < DIM; i++) input[i] = 1.0f;
+            if (ane_matvec(k, output, input, DIM, DIM)) {
+                float sum = 0;
+                for (int i = 0; i < DIM; i++) sum += output[i];
+                fprintf(stderr, "  -> Eval OK, output sum = %.4f\n", sum);
+            } else {
+                fprintf(stderr, "  -> Eval FAILED\n");
+            }
+            ane_free(k);
+        } else {
+            fprintf(stderr, "FAILED (compile rejected)\n");
+        }
+    }
+
+    // --- Test 4: Approach B — CPU-side INT8 quantize → dequantize → FP16 ANE ---
+    {
+        fprintf(stderr, "\nTest 4: CPU-side INT8 per-channel quant → dequant → FP16 ANE...\n");
+
+        // Step 1: Create random FP32 "ground truth" weights (typical range for LLM weights)
+        float* f32_orig = (float*)malloc(DIM * DIM * sizeof(float));
+        srand48(123);
+        for (int i = 0; i < DIM * DIM; i++) {
+            f32_orig[i] = (float)(drand48() * 0.2 - 0.1);  // [-0.1, 0.1]
+        }
+
+        // Step 2: Convert ground truth to FP16 for "original" ANE kernel
+        uint16_t* fp16_orig = (uint16_t*)malloc(DIM * DIM * sizeof(uint16_t));
+        for (int i = 0; i < DIM * DIM; i++) {
+            fp16_orig[i] = f32_to_f16(f32_orig[i]);
+        }
+
+        // Step 3: Quantize FP32 → INT8 per-channel (per output row)
+        //   For each row: scale = (max - min) / 255, zero_point = round(-min / scale)
+        //   q[i] = clamp(round(f[i] / scale) + zero_point, 0, 255)
+        uint8_t* q8_weights = (uint8_t*)malloc(DIM * DIM);
+        float* ch_scales = (float*)malloc(DIM * sizeof(float));
+        int* ch_zeros = (int*)malloc(DIM * sizeof(int));
+
+        for (int row = 0; row < DIM; row++) {
+            float rmin = f32_orig[row * DIM], rmax = f32_orig[row * DIM];
+            for (int col = 1; col < DIM; col++) {
+                float v = f32_orig[row * DIM + col];
+                if (v < rmin) rmin = v;
+                if (v > rmax) rmax = v;
+            }
+            float range = rmax - rmin;
+            if (range < 1e-8f) range = 1e-8f;
+            float s = range / 255.0f;
+            int zp = (int)roundf(-rmin / s);
+            if (zp < 0) zp = 0;
+            if (zp > 255) zp = 255;
+            ch_scales[row] = s;
+            ch_zeros[row] = zp;
+
+            for (int col = 0; col < DIM; col++) {
+                int q = (int)roundf(f32_orig[row * DIM + col] / s) + zp;
+                if (q < 0) q = 0;
+                if (q > 255) q = 255;
+                q8_weights[row * DIM + col] = (uint8_t)q;
+            }
+        }
+
+        // Step 4: Dequantize INT8 → FP16 on CPU
+        //   f[i] = (q[i] - zero_point) * scale
+        uint16_t* fp16_deq = (uint16_t*)malloc(DIM * DIM * sizeof(uint16_t));
+        for (int row = 0; row < DIM; row++) {
+            for (int col = 0; col < DIM; col++) {
+                float val = ((float)q8_weights[row * DIM + col] - ch_zeros[row]) * ch_scales[row];
+                fp16_deq[row * DIM + col] = f32_to_f16(val);
+            }
+        }
+
+        // Step 5: Build two FP16 ANE kernels — original and dequantized
+        void* pool = objc_autoreleasePoolPush();
+
+        // Original FP16 kernel — use build_weight_blob_raw since data is already FP16
+        id blob_orig = build_weight_blob_raw(fp16_orig, DIM * DIM * sizeof(uint16_t));
+        char kn[128]; snprintf(kn, sizeof(kn), "@model_path/weights/weight.bin");
+        id k_orig = ns_str(kn); id v_orig = ns_weight_entry(blob_orig);
+        id wdict_orig = ns_dict(&k_orig, &v_orig, 1);
+
+        id mil = mil_gen_matmul(DIM, DIM);
+        size_t in_bytes = (size_t)DIM * SP * sizeof(uint16_t);
+        size_t out_bytes = (size_t)DIM * SP * sizeof(uint16_t);
+        ANEKernel* k1 = ane_compile_raw(mil, wdict_orig, 1, &in_bytes, 1, &out_bytes);
+
+        // Dequantized FP16 kernel
+        id blob_deq = build_weight_blob_raw(fp16_deq, DIM * DIM * sizeof(uint16_t));
+        id k_deq = ns_str(kn); id v_deq = ns_weight_entry(blob_deq);
+        id wdict_deq = ns_dict(&k_deq, &v_deq, 1);
+
+        id mil2 = mil_gen_matmul(DIM, DIM);
+        ANEKernel* k2 = ane_compile_raw(mil2, wdict_deq, 1, &in_bytes, 1, &out_bytes);
+
+        objc_autoreleasePoolPop(pool);
+
+        if (!k1 || !k2) {
+            fprintf(stderr, "  FAILED: compile error (orig=%s, deq=%s)\n",
+                    k1 ? "ok" : "fail", k2 ? "ok" : "fail");
+            if (k1) ane_free(k1);
+            if (k2) ane_free(k2);
+        } else {
+            fprintf(stderr, "  Both kernels compiled OK\n");
+
+            // Step 6: Run both with same input, compare outputs
+            float input[DIM];
+            for (int i = 0; i < DIM; i++) input[i] = 1.0f;
+
+            float out_orig[DIM], out_deq[DIM];
+            bool ok1 = ane_matvec(k1, out_orig, input, DIM, DIM);
+            bool ok2 = ane_matvec(k2, out_deq, input, DIM, DIM);
+
+            if (ok1 && ok2) {
+                // Compute error metrics
+                float max_err = 0, sum_sq_err = 0, sum_sq_orig = 0;
+                for (int i = 0; i < DIM; i++) {
+                    float err = fabsf(out_orig[i] - out_deq[i]);
+                    if (err > max_err) max_err = err;
+                    sum_sq_err += err * err;
+                    sum_sq_orig += out_orig[i] * out_orig[i];
+                }
+                float rmse = sqrtf(sum_sq_err / DIM);
+                float nrmse = (sum_sq_orig > 0) ? sqrtf(sum_sq_err / sum_sq_orig) : 0;
+
+                fprintf(stderr, "  Eval OK — error metrics:\n");
+                fprintf(stderr, "    Max abs error:  %.6f\n", max_err);
+                fprintf(stderr, "    RMSE:           %.6f\n", rmse);
+                fprintf(stderr, "    Normalized RMSE: %.4f%%\n", nrmse * 100.0f);
+
+                // Show sample outputs
+                fprintf(stderr, "    Sample outputs (first 4):\n");
+                for (int i = 0; i < 4 && i < DIM; i++) {
+                    fprintf(stderr, "      [%d] orig=%.6f  deq=%.6f  diff=%.6f\n",
+                            i, out_orig[i], out_deq[i], out_orig[i] - out_deq[i]);
+                }
+
+                // Storage savings
+                size_t orig_bytes = (size_t)DIM * DIM * 2;  // FP16
+                size_t q8_bytes = (size_t)DIM * DIM + DIM * 4 + DIM * 4;  // INT8 + scales + zeros
+                fprintf(stderr, "    Storage: FP16=%zu bytes, INT8=%zu bytes (%.1f%% of FP16)\n",
+                        orig_bytes, q8_bytes, (float)q8_bytes / orig_bytes * 100.0f);
+
+                // Throughput benchmark: run each kernel N times
+                const int BENCH_ITERS = 5000;
+                // Warmup
+                for (int i = 0; i < 50; i++) {
+                    ane_matvec(k1, out_orig, input, DIM, DIM);
+                    ane_matvec(k2, out_deq, input, DIM, DIM);
+                }
+
+                Timer t1;
+                for (int i = 0; i < BENCH_ITERS; i++) {
+                    ane_matvec(k1, out_orig, input, DIM, DIM);
+                }
+                double ms_orig = t1.elapsed_ms();
+
+                Timer t2;
+                for (int i = 0; i < BENCH_ITERS; i++) {
+                    ane_matvec(k2, out_deq, input, DIM, DIM);
+                }
+                double ms_deq = t2.elapsed_ms();
+
+                double tps_orig = BENCH_ITERS / (ms_orig / 1000.0);
+                double tps_deq  = BENCH_ITERS / (ms_deq / 1000.0);
+                fprintf(stderr, "    Throughput (%d iters, dim=%d):\n", BENCH_ITERS, DIM);
+                fprintf(stderr, "      Original FP16: %.1f calls/s (%.3f ms total)\n", tps_orig, ms_orig);
+                fprintf(stderr, "      Dequant  FP16: %.1f calls/s (%.3f ms total)\n", tps_deq, ms_deq);
+                fprintf(stderr, "      Ratio: %.4fx\n", tps_deq / tps_orig);
+            } else {
+                fprintf(stderr, "  Eval FAILED (orig=%s, deq=%s)\n",
+                        ok1 ? "ok" : "fail", ok2 ? "ok" : "fail");
+            }
+            ane_free(k1);
+            ane_free(k2);
+        }
+
+        free(f32_orig); free(fp16_orig);
+        free(q8_weights); free(ch_scales); free(ch_zeros);
+        free(fp16_deq);
+    }
+
+    fprintf(stderr, "\n=== Probe complete ===\n");
+
+    free(quant_w); free(scales); free(zero_pts);
+    free(signed_w); free(block_scales); free(fp16_w);
+    g_ane_persist_cache = prev_cache;
+    return true;
+}
+
 } // namespace ane_lm

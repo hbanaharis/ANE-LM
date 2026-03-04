@@ -142,11 +142,11 @@ void Qwen35Model::apply_args(const Qwen35Args& args) {
     rot_dim_ = args.rotation_dim();
     rope_theta_ = args.rope_theta;
     rms_eps_ = args.rms_norm_eps;
-    lin_num_heads_ = args.linear_num_key_heads;
+    lin_num_key_heads_ = args.linear_num_key_heads;
     lin_num_val_heads_ = args.linear_num_value_heads;
     lin_key_dim_ = args.linear_key_head_dim;
     lin_val_dim_ = args.linear_value_head_dim;
-    lin_total_key_ = lin_num_heads_ * lin_key_dim_;
+    lin_total_key_ = lin_num_key_heads_ * lin_key_dim_;
     lin_total_val_ = lin_num_val_heads_ * lin_val_dim_;
     lin_qkv_dim_ = lin_total_key_ * 2 + lin_total_val_;
     conv_kernel_ = args.linear_conv_kernel_dim;
@@ -155,6 +155,25 @@ void Qwen35Model::apply_args(const Qwen35Args& args) {
     full_out_dim_ = num_q_heads_ * head_dim_;
     attn_output_gate_ = args.attn_output_gate;
     layer_types_ = args.layer_types;
+}
+
+bool Qwen35Model::detect_weight_prefix(ModelWeights* sf) {
+    static const char* prefixes[] = {
+        "model.language_model.",
+        "model.",
+        "",
+    };
+    for (auto* p : prefixes) {
+        char name[256];
+        snprintf(name, sizeof(name), "%sembed_tokens.weight", p);
+        if (sf->find(name)) {
+            weight_prefix_ = p;
+            LOG("Weight prefix: \"%s\"\n", weight_prefix_.c_str());
+            return true;
+        }
+    }
+    fprintf(stderr, "Cannot detect weight prefix: embed_tokens.weight not found\n");
+    return false;
 }
 
 bool Qwen35Model::load(const std::string& model_dir) {
@@ -176,13 +195,22 @@ bool Qwen35Model::load(const std::string& model_dir) {
         return false;
     }
 
+    // 3. Detect weight naming convention
+    if (!detect_weight_prefix(sf.get())) {
+        return false;
+    }
+
     // Infer dims from safetensors
-    const SFTensor* embed = sf->find("model.language_model.embed_tokens.weight");
+    char embed_name[256], gate_name[256];
+    snprintf(embed_name, sizeof(embed_name), "%sembed_tokens.weight", weight_prefix_.c_str());
+    snprintf(gate_name, sizeof(gate_name), "%slayers.0.mlp.gate_proj.weight", weight_prefix_.c_str());
+
+    const SFTensor* embed = sf->find(embed_name);
     if (!embed || embed->ndims != 2) {
         fprintf(stderr, "Cannot infer dims: missing or invalid embed_tokens.weight\n");
         return false;
     }
-    const SFTensor* gate = sf->find("model.language_model.layers.0.mlp.gate_proj.weight");
+    const SFTensor* gate = sf->find(gate_name);
     if (!gate || gate->ndims != 2) {
         fprintf(stderr, "Cannot infer dims: missing or invalid gate_proj.weight\n");
         return false;
@@ -205,7 +233,7 @@ bool Qwen35Model::load(const std::string& model_dir) {
     scratch_qkv_ = (float*)calloc(lin_qkv_dim_ + lin_total_val_, sizeof(float));
     scratch_conv_ = (float*)calloc(lin_qkv_dim_, sizeof(float));
     scratch_y_ = (float*)calloc(lin_total_val_, sizeof(float));
-    scratch_attn_ = (float*)calloc(full_out_dim_, sizeof(float));
+    scratch_attn_ = (float*)calloc(std::max(full_out_dim_, lin_total_val_), sizeof(float));
     // scratch_tmp_: a_vec (lin_num_val_heads_) + b_vec (lin_num_val_heads_) + silu_tmp (lin_qkv_dim_)
     scratch_tmp_ = (float*)calloc((size_t)lin_num_val_heads_ * 2 + lin_qkv_dim_, sizeof(float));
     rope_cos_ = (float*)calloc((size_t)MAX_SEQ_LEN * (rot_dim_ / 2), sizeof(float));
@@ -269,23 +297,25 @@ bool Qwen35Model::load(const std::string& model_dir) {
 
 bool Qwen35Model::load_weights(ModelWeights* sf) {
     char name[256];
+    const char* pfx = weight_prefix_.c_str();
 
-    embed_tokens_ = sf->load_bf16_to_f32("model.language_model.embed_tokens.weight",
-                                           (int64_t)vocab_size_ * hidden_size_);
+    snprintf(name, sizeof(name), "%sembed_tokens.weight", pfx);
+    embed_tokens_ = sf->load_bf16_to_f32(name, (int64_t)vocab_size_ * hidden_size_);
     if (!embed_tokens_) return false;
 
-    final_norm_ = sf->load_norm_weight("model.language_model.norm.weight", hidden_size_);
+    snprintf(name, sizeof(name), "%snorm.weight", pfx);
+    final_norm_ = sf->load_norm_weight(name, hidden_size_);
     if (!final_norm_) return false;
 
     for (int L = 0; L < num_layers_; L++) {
         auto& lw = layers_[L];
         lw.type = layer_types_[L];
 
-        snprintf(name, sizeof(name), "model.language_model.layers.%d.input_layernorm.weight", L);
+        snprintf(name, sizeof(name), "%slayers.%d.input_layernorm.weight", pfx, L);
         lw.input_layernorm = sf->load_norm_weight(name, hidden_size_);
         if (!lw.input_layernorm) return false;
 
-        snprintf(name, sizeof(name), "model.language_model.layers.%d.post_attention_layernorm.weight", L);
+        snprintf(name, sizeof(name), "%slayers.%d.post_attention_layernorm.weight", pfx, L);
         lw.post_attention_layernorm = sf->load_norm_weight(name, hidden_size_);
         if (!lw.post_attention_layernorm) return false;
 
@@ -293,25 +323,25 @@ bool Qwen35Model::load_weights(ModelWeights* sf) {
             auto& dw = lw.deltanet;
 
             // Note: in_proj_a/b, A_log, dt_bias use linear_num_value_heads (not key_heads)
-            snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.in_proj_a.weight", L);
+            snprintf(name, sizeof(name), "%slayers.%d.linear_attn.in_proj_a.weight", pfx, L);
             dw.in_proj_a = sf->load_bf16_to_f32(name, (int64_t)lin_num_val_heads_ * hidden_size_);
 
-            snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.in_proj_b.weight", L);
+            snprintf(name, sizeof(name), "%slayers.%d.linear_attn.in_proj_b.weight", pfx, L);
             dw.in_proj_b = sf->load_bf16_to_f32(name, (int64_t)lin_num_val_heads_ * hidden_size_);
 
-            snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.conv1d.weight", L);
+            snprintf(name, sizeof(name), "%slayers.%d.linear_attn.conv1d.weight", pfx, L);
             dw.conv1d_w = sf->load_bf16_to_f32(name, (int64_t)lin_qkv_dim_ * conv_kernel_);
 
-            snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.A_log", L);
+            snprintf(name, sizeof(name), "%slayers.%d.linear_attn.A_log", pfx, L);
             dw.A = sf->load_f32_direct(name, lin_num_val_heads_);
             if (dw.A) {
                 for (int i = 0; i < lin_num_val_heads_; i++) dw.A[i] = expf(dw.A[i]);
             }
 
-            snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.dt_bias", L);
+            snprintf(name, sizeof(name), "%slayers.%d.linear_attn.dt_bias", pfx, L);
             dw.dt_bias = sf->load_bf16_to_f32(name, lin_num_val_heads_);
 
-            snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.norm.weight", L);
+            snprintf(name, sizeof(name), "%slayers.%d.linear_attn.norm.weight", pfx, L);
             dw.norm_w = sf->load_f32_direct(name, lin_val_dim_);
 
             if (!dw.in_proj_a || !dw.in_proj_b || !dw.conv1d_w ||
@@ -322,10 +352,10 @@ bool Qwen35Model::load_weights(ModelWeights* sf) {
         } else {
             auto& fw = lw.full_attn;
 
-            snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.q_norm.weight", L);
+            snprintf(name, sizeof(name), "%slayers.%d.self_attn.q_norm.weight", pfx, L);
             fw.q_norm = sf->load_norm_weight(name, head_dim_);
 
-            snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.k_norm.weight", L);
+            snprintf(name, sizeof(name), "%slayers.%d.self_attn.k_norm.weight", pfx, L);
             fw.k_norm = sf->load_norm_weight(name, head_dim_);
 
             if (!fw.q_norm || !fw.k_norm) {
@@ -358,14 +388,15 @@ bool Qwen35Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
     bool use_blobs = !blob_dir.empty();
     LOG("Compiling ANE kernels%s...\n", use_blobs ? " (from blobs)" : "");
     char name[256], name2[256], name3[256];
+    const char* pfx = weight_prefix_.c_str();
 
     for (int L = 0; L < num_layers_; L++) {
         LOG("  Layer %d/%d (%s)...\r", L+1, num_layers_,
             layer_types_[L] == LayerType::LinearAttention ? "deltanet" : "full_attn");
 
         if (layer_types_[L] == LayerType::LinearAttention) {
-            snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.in_proj_qkv.weight", L);
-            snprintf(name2, sizeof(name2), "model.language_model.layers.%d.linear_attn.in_proj_z.weight", L);
+            snprintf(name, sizeof(name), "%slayers.%d.linear_attn.in_proj_qkv.weight", pfx, L);
+            snprintf(name2, sizeof(name2), "%slayers.%d.linear_attn.in_proj_z.weight", pfx, L);
 
             if (use_blobs) {
                 ane_layers_[L].first_proj = ane_compile_fused_2_blob(
@@ -377,9 +408,9 @@ bool Qwen35Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
                     sf->get_bf16_ptr(name2), lin_total_val_, hidden_size_);
             }
         } else {
-            snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.q_proj.weight", L);
-            snprintf(name2, sizeof(name2), "model.language_model.layers.%d.self_attn.k_proj.weight", L);
-            snprintf(name3, sizeof(name3), "model.language_model.layers.%d.self_attn.v_proj.weight", L);
+            snprintf(name, sizeof(name), "%slayers.%d.self_attn.q_proj.weight", pfx, L);
+            snprintf(name2, sizeof(name2), "%slayers.%d.self_attn.k_proj.weight", pfx, L);
+            snprintf(name3, sizeof(name3), "%slayers.%d.self_attn.v_proj.weight", pfx, L);
 
             if (use_blobs) {
                 ane_layers_[L].first_proj = ane_compile_fused_3_blob(
@@ -402,10 +433,10 @@ bool Qwen35Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
         // O projection
         int attn_dim;
         if (layer_types_[L] == LayerType::LinearAttention) {
-            snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.out_proj.weight", L);
+            snprintf(name, sizeof(name), "%slayers.%d.linear_attn.out_proj.weight", pfx, L);
             attn_dim = lin_total_val_;
         } else {
-            snprintf(name, sizeof(name), "model.language_model.layers.%d.self_attn.o_proj.weight", L);
+            snprintf(name, sizeof(name), "%slayers.%d.self_attn.o_proj.weight", pfx, L);
             attn_dim = full_out_dim_;
         }
         if (use_blobs) {
@@ -419,9 +450,9 @@ bool Qwen35Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
         }
 
         // Fused FFN
-        snprintf(name, sizeof(name), "model.language_model.layers.%d.mlp.gate_proj.weight", L);
-        snprintf(name2, sizeof(name2), "model.language_model.layers.%d.mlp.up_proj.weight", L);
-        snprintf(name3, sizeof(name3), "model.language_model.layers.%d.mlp.down_proj.weight", L);
+        snprintf(name, sizeof(name), "%slayers.%d.mlp.gate_proj.weight", pfx, L);
+        snprintf(name2, sizeof(name2), "%slayers.%d.mlp.up_proj.weight", pfx, L);
+        snprintf(name3, sizeof(name3), "%slayers.%d.mlp.down_proj.weight", pfx, L);
 
         if (use_blobs) {
             ane_layers_[L].fused_ffn = ane_compile_fused_ffn_blob(
@@ -457,9 +488,12 @@ bool Qwen35Model::compile_lm_head_ane(ModelWeights* sf, const std::string& blob_
     bool use_blobs = !blob_dir.empty();
 
     // For blob mode, we need the embed blob; for bf16 mode, the bf16 pointer
+    char embed_name[256];
+    snprintf(embed_name, sizeof(embed_name), "%sembed_tokens.weight", weight_prefix_.c_str());
+
     const uint16_t* embed_bf16 = nullptr;
     if (!use_blobs) {
-        embed_bf16 = sf->get_bf16_ptr("model.language_model.embed_tokens.weight");
+        embed_bf16 = sf->get_bf16_ptr(embed_name);
         if (!embed_bf16) {
             fprintf(stderr, "ANE LM head: missing embed_tokens BF16 weights\n");
             return false;
@@ -484,7 +518,7 @@ bool Qwen35Model::compile_lm_head_ane(ModelWeights* sf, const std::string& blob_
             // LM head reuses embed_tokens weight, chunked by row offset
             // Blob was written as one file; we need per-chunk blobs or fall back to bf16
             // For now: fall back to bf16 for LM head since embed_tokens is one big blob
-            embed_bf16 = sf->get_bf16_ptr("model.language_model.embed_tokens.weight");
+            embed_bf16 = sf->get_bf16_ptr(embed_name);
             if (!embed_bf16) return false;
             const uint16_t* chunk_w = embed_bf16 + (int64_t)offset * hidden_size_;
             lm_head_kernels_[c] = ane_compile_matmul(chunk_w, rows, hidden_size_);
@@ -543,32 +577,30 @@ bool Qwen35Model::forward_deltanet_core(int L, float* x, float* pre_oproj) {
     float* K = conv_out + lin_total_key_;
     float* V = conv_out + lin_total_key_ * 2;
 
-    // Per-head SSM
-    // Architecture: 16 key heads, 32 value heads
-    // Each key head pairs with 2 value heads (val_heads_per_key = 2)
+    // Per-head SSM (GQA-style: value heads may outnumber key heads)
     float* y = scratch_y_;
     float q_scale = 1.0f / sqrtf((float)lin_key_dim_);
-    int val_heads_per_key = lin_num_val_heads_ / lin_num_heads_;
+    int kv_group = lin_num_val_heads_ / lin_num_key_heads_;  // value heads per key head
 
-    for (int kh = 0; kh < lin_num_heads_; kh++) {
-        float* qh = Q + kh * lin_key_dim_;
-        float* kh_ptr = K + kh * lin_key_dim_;
+    // Pre-normalize Q and K (once per key head, before GQA sharing)
+    for (int kh = 0; kh < lin_num_key_heads_; kh++) {
+        l2_normalize(Q + kh * lin_key_dim_, lin_key_dim_);
+        l2_normalize(K + kh * lin_key_dim_, lin_key_dim_);
+        vDSP_vsmul(Q + kh * lin_key_dim_, 1, &q_scale,
+                   Q + kh * lin_key_dim_, 1, (vDSP_Length)lin_key_dim_);
+    }
 
-        l2_normalize(qh, lin_key_dim_);
-        l2_normalize(kh_ptr, lin_key_dim_);
-        float qs = q_scale;
-        vDSP_vsmul(qh, 1, &qs, qh, 1, (vDSP_Length)lin_key_dim_);
+    for (int h = 0; h < lin_num_val_heads_; h++) {
+        int kh_idx = (kv_group > 1) ? (h / kv_group) : h;
+        float* qh = Q + kh_idx * lin_key_dim_;
+        float* kh_ptr = K + kh_idx * lin_key_dim_;
+        float* vh = V + h * lin_val_dim_;
+        float* yh = y + h * lin_val_dim_;
+        float* state = st.ssm_state + h * lin_key_dim_ * lin_val_dim_;
 
-        for (int vsub = 0; vsub < val_heads_per_key; vsub++) {
-            int vh = kh * val_heads_per_key + vsub;
-            float* vh_ptr = V + vh * lin_val_dim_;
-            float* yh = y + vh * lin_val_dim_;
-            float* state = st.ssm_state + vh * lin_key_dim_ * lin_val_dim_;
-
-            float beta = sigmoid_f(b_vec[vh]);
-            float decay = expf(-dw.A[vh] * softplus_f(a_vec[vh] + dw.dt_bias[vh]));
-            ssm_step(yh, state, qh, kh_ptr, vh_ptr, decay, beta, lin_key_dim_, lin_val_dim_);
-        }
+        float beta = sigmoid_f(b_vec[h]);
+        float decay = expf(-dw.A[h] * softplus_f(a_vec[h] + dw.dt_bias[h]));
+        ssm_step(yh, state, qh, kh_ptr, vh, decay, beta, lin_key_dim_, lin_val_dim_);
     }
 
     // RMSNorm gated
