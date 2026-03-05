@@ -10,7 +10,8 @@ namespace ane_lm {
 using json = nlohmann::json;
 
 std::pair<std::unique_ptr<LLMModel>, Tokenizer> load(
-    const std::string& model_dir, bool ane_cache)
+    const std::string& model_dir, bool ane_cache,
+    const std::string& backend)
 {
     Timer timer;
 
@@ -39,7 +40,7 @@ std::pair<std::unique_ptr<LLMModel>, Tokenizer> load(
 
     // Model self-loads (config, safetensors, ANE)
     timer.reset();
-    if (!model->load(model_dir)) {
+    if (!model->load(model_dir, backend)) {
         throw std::runtime_error("Failed to load model from " + model_dir);
     }
     LOG("Model init: %.1f ms\n", timer.elapsed_ms());

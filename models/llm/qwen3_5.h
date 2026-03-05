@@ -2,6 +2,7 @@
 
 #include "../../core/model_loader.h"
 #include "../../core/ane_runtime.h"
+#include "../../core/coreml_runtime.h"
 #include <nlohmann/json.hpp>
 #include <memory>
 #include <string>
@@ -18,7 +19,7 @@ enum class LayerType {
 class LLMModel {
 public:
     virtual ~LLMModel() = default;
-    virtual bool load(const std::string& model_dir) = 0;
+    virtual bool load(const std::string& model_dir, const std::string& backend = "ane") = 0;
     virtual float* forward(int token_id, int pos) = 0;
     virtual void reset() = 0;
     virtual int vocab_size() const = 0;
@@ -60,7 +61,7 @@ struct Qwen35Args {
 class Qwen35Model : public LLMModel {
 public:
     ~Qwen35Model() override;
-    bool load(const std::string& model_dir) override;
+    bool load(const std::string& model_dir, const std::string& backend = "ane") override;
     float* forward(int token_id, int pos) override;
     void reset() override;
     int vocab_size() const override { return vocab_size_; }
@@ -147,6 +148,16 @@ private:
     std::vector<KVCache> kv_caches_;
     std::vector<LayerANEKernels> ane_layers_;
 
+    // CoreML backend
+    bool use_coreml_ = false;
+    struct LayerCoreMLKernels {
+        CoreMLKernel* first_proj = nullptr;
+        CoreMLKernel* o_proj = nullptr;
+        CoreMLKernel* fused_ffn = nullptr;
+    };
+    std::vector<LayerCoreMLKernels> coreml_layers_;
+    std::vector<CoreMLKernel*> coreml_lm_head_;
+
     // LM head ANE kernels
     std::vector<ANEKernel*> lm_head_kernels_;
     int lm_head_chunk_ = LM_HEAD_ANE_CHUNK_MAX;
@@ -170,6 +181,15 @@ private:
     bool compile_ane(ModelWeights* sf, const std::string& blob_dir);
     bool compile_lm_head_ane(ModelWeights* sf, const std::string& blob_dir);
     void free_lm_head_ane();
+    bool compile_coreml(const std::string& coreml_dir);
+
+    // Dispatch helper: calls coreml_predict or ane_matvec based on backend
+    bool predict_matvec(int layer, int op, float* output, const float* input,
+                        int in_dim, int out_dim);
+    // op indices for predict_matvec
+    static constexpr int OP_FIRST_PROJ = 0;
+    static constexpr int OP_O_PROJ = 1;
+    static constexpr int OP_FUSED_FFN = 2;
 
     bool forward_deltanet_core(int L, float* x, float* pre_oproj);
     bool forward_full_attn_core(int L, float* x, float* pre_oproj, int pos);

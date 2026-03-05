@@ -59,6 +59,7 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  --temp T          Temperature (default: 0.6)\n");
     fprintf(stderr, "  --repeat-penalty P Repetition penalty (default: 1.2, 1.0=off)\n");
     fprintf(stderr, "  --enable-thinking Enable thinking/reasoning mode\n");
+    fprintf(stderr, "  --backend <name>  Compute backend: ane (default) or coreml\n");
     fprintf(stderr, "  --no-ane-cache    Disable persistent ANE compile cache\n");
     fprintf(stderr, "  -v, --verbose     Show detailed initialization info\n");
     fprintf(stderr, "\nExamples:\n");
@@ -71,6 +72,7 @@ struct Args {
     const char* model_dir = nullptr;
     const char* prompt = "Hello";
     const char* socket_path = nullptr;
+    const char* backend = "ane";
     float temperature = 0.6f;
     int max_tokens = 0;
     float repetition_penalty = 1.2f;
@@ -91,6 +93,8 @@ static Args parse_args(int argc, char* argv[], int start) {
             args.temperature = atof(argv[++i]);
         } else if (strcmp(argv[i], "--repeat-penalty") == 0 && i + 1 < argc) {
             args.repetition_penalty = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
+            args.backend = argv[++i];
         } else if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc) {
             args.socket_path = argv[++i];
         } else if (strcmp(argv[i], "--enable-thinking") == 0) {
@@ -452,13 +456,14 @@ int main(int argc, char* argv[]) {
     LOG("Model: %s\n", args.model_dir);
     LOG("Mode: %s\n", is_serve ? "serve" : (is_chat ? "chat" : "generate"));
     LOG("Temperature: %.2f, Max tokens: %d\n", args.temperature, args.max_tokens);
+    LOG("Backend: %s\n", args.backend);
     LOG("ANE compile cache: %s\n", args.ane_cache ? "enabled" : "disabled");
 
     // Load model + tokenizer
     std::unique_ptr<LLMModel> model;
     Tokenizer tokenizer;
     try {
-        auto result = load(args.model_dir, args.ane_cache);
+        auto result = load(args.model_dir, args.ane_cache, std::string(args.backend));
         model = std::move(result.first);
         tokenizer = std::move(result.second);
     } catch (const std::exception& e) {

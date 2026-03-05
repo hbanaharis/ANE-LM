@@ -27,7 +27,7 @@ struct Qwen3Args {
 class Qwen3Model : public LLMModel {
 public:
     ~Qwen3Model() override;
-    bool load(const std::string& model_dir) override;
+    bool load(const std::string& model_dir, const std::string& backend = "ane") override;
     float* forward(int token_id, int pos) override;
     void reset() override;
     int vocab_size() const override { return vocab_size_; }

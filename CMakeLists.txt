@@ -49,6 +49,7 @@ set(CORE_SOURCES
     core/cpu_ops.cpp
     core/sampling.cpp
     core/ane_runtime.cpp
+    core/coreml_runtime.cpp
     utils.cpp
     generate.cpp
 )
@@ -77,6 +78,7 @@ target_link_libraries(ane-lm PRIVATE
     "-framework Foundation"
     "-framework IOSurface"
     "-framework Accelerate"
+    "-framework CoreML"
     "-lobjc"
 )
 

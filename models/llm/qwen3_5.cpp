@@ -112,6 +112,14 @@ Qwen35Model::~Qwen35Model() {
         ane_free_layer(&ane_layers_[L]);
     }
 
+    // Free CoreML kernels
+    for (auto& cl : coreml_layers_) {
+        coreml_free(cl.first_proj);
+        coreml_free(cl.o_proj);
+        coreml_free(cl.fused_ffn);
+    }
+    for (auto* k : coreml_lm_head_) coreml_free(k);
+
     free_lm_head_ane();
 }
 
@@ -176,7 +184,7 @@ bool Qwen35Model::detect_weight_prefix(ModelWeights* sf) {
     return false;
 }
 
-bool Qwen35Model::load(const std::string& model_dir) {
+bool Qwen35Model::load(const std::string& model_dir, const std::string& backend) {
     // 1. Read config.json and parse args
     std::string config_path = model_dir + "/config.json";
     std::ifstream f(config_path);
@@ -290,7 +298,20 @@ bool Qwen35Model::load(const std::string& model_dir) {
         LOG("Using pre-converted ANE blobs from %s\n", blob_dir.c_str());
     }
 
-    if (!compile_ane(sf.get(), has_blobs ? blob_dir : "")) { return false; }
+    // Check for CoreML backend
+    if (backend == "coreml") {
+        std::string coreml_dir = model_dir + "-coreml";
+        struct stat st_coreml;
+        if (stat(coreml_dir.c_str(), &st_coreml) != 0 || !S_ISDIR(st_coreml.st_mode)) {
+            fprintf(stderr, "CoreML backend requested but %s not found.\n"
+                    "Run: python scripts/export_coreml_model.py --model %s --output %s\n",
+                    coreml_dir.c_str(), model_dir.c_str(), coreml_dir.c_str());
+            return false;
+        }
+        if (!compile_coreml(coreml_dir)) { return false; }
+    } else {
+        if (!compile_ane(sf.get(), has_blobs ? blob_dir : "")) { return false; }
+    }
 
     return true;
 }
@@ -544,14 +565,111 @@ void Qwen35Model::free_lm_head_ane() {
     ane_lm_head_enabled_ = false;
 }
 
+bool Qwen35Model::compile_coreml(const std::string& coreml_dir) {
+    if (!coreml_available()) {
+        fprintf(stderr, "CoreML not available\n");
+        return false;
+    }
+
+    LOG("Loading CoreML models from %s...\n", coreml_dir.c_str());
+    coreml_layers_.resize(num_layers_);
+    use_coreml_ = true;
+
+    for (int L = 0; L < num_layers_; L++) {
+        LOG("  Layer %d/%d (%s)...\r", L+1, num_layers_,
+            layer_types_[L] == LayerType::LinearAttention ? "deltanet" : "full_attn");
+
+        // first_proj
+        std::string first_proj_path = coreml_dir + "/layer_" + std::to_string(L) + "_first_proj.mlpackage";
+        int first_proj_out;
+        if (layer_types_[L] == LayerType::LinearAttention) {
+            first_proj_out = lin_qkv_dim_ + lin_total_val_;
+        } else {
+            first_proj_out = full_q_dim_ + full_kv_dim_ * 2;
+        }
+        coreml_layers_[L].first_proj = coreml_load(first_proj_path, hidden_size_, first_proj_out);
+        if (!coreml_layers_[L].first_proj) {
+            fprintf(stderr, "CoreML first_proj load failed for layer %d\n", L);
+            return false;
+        }
+
+        // o_proj
+        std::string o_proj_path = coreml_dir + "/layer_" + std::to_string(L) + "_o_proj.mlpackage";
+        int attn_dim = (layer_types_[L] == LayerType::LinearAttention) ? lin_total_val_ : full_out_dim_;
+        coreml_layers_[L].o_proj = coreml_load(o_proj_path, attn_dim, hidden_size_);
+        if (!coreml_layers_[L].o_proj) {
+            fprintf(stderr, "CoreML o_proj load failed for layer %d\n", L);
+            return false;
+        }
+
+        // fused_ffn
+        std::string ffn_path = coreml_dir + "/layer_" + std::to_string(L) + "_fused_ffn.mlpackage";
+        coreml_layers_[L].fused_ffn = coreml_load(ffn_path, hidden_size_, hidden_size_);
+        if (!coreml_layers_[L].fused_ffn) {
+            fprintf(stderr, "CoreML fused_ffn load failed for layer %d\n", L);
+            return false;
+        }
+    }
+    LOG("  %d CoreML layer models loaded\n", num_layers_ * 3);
+
+    // LM head chunks
+    for (int c = 0; ; c++) {
+        std::string lm_path = coreml_dir + "/lm_head_chunk_" + std::to_string(c) + ".mlpackage";
+        struct stat st;
+        if (stat(lm_path.c_str(), &st) != 0) break;
+
+        int chunk_rows = LM_HEAD_ANE_CHUNK_MAX;
+        int remaining = vocab_size_ - c * LM_HEAD_ANE_CHUNK_MAX;
+        if (remaining < chunk_rows) chunk_rows = remaining;
+
+        CoreMLKernel* k = coreml_load(lm_path, hidden_size_, chunk_rows);
+        if (!k) {
+            fprintf(stderr, "CoreML LM head chunk %d load failed\n", c);
+            // Non-fatal: fall back to CPU for LM head
+            break;
+        }
+        coreml_lm_head_.push_back(k);
+    }
+    if (!coreml_lm_head_.empty()) {
+        lm_head_chunk_ = LM_HEAD_ANE_CHUNK_MAX;
+        ane_lm_head_enabled_ = true;
+        LOG("  LM head: %d CoreML chunks\n", (int)coreml_lm_head_.size());
+    } else {
+        LOG("  LM head: CPU fallback\n");
+    }
+
+    return true;
+}
+
+bool Qwen35Model::predict_matvec(int layer, int op, float* output, const float* input,
+                                  int in_dim, int out_dim) {
+    if (use_coreml_) {
+        CoreMLKernel* k = nullptr;
+        switch (op) {
+            case OP_FIRST_PROJ: k = coreml_layers_[layer].first_proj; break;
+            case OP_O_PROJ:     k = coreml_layers_[layer].o_proj;     break;
+            case OP_FUSED_FFN:  k = coreml_layers_[layer].fused_ffn;  break;
+        }
+        return coreml_predict(k, output, input, in_dim, out_dim);
+    } else {
+        ANEKernel* k = nullptr;
+        switch (op) {
+            case OP_FIRST_PROJ: k = ane_layers_[layer].first_proj; break;
+            case OP_O_PROJ:     k = ane_layers_[layer].o_proj;     break;
+            case OP_FUSED_FFN:  k = ane_layers_[layer].fused_ffn;  break;
+        }
+        return ane_matvec(k, output, input, in_dim, out_dim);
+    }
+}
+
 bool Qwen35Model::forward_deltanet_core(int L, float* x, float* pre_oproj) {
     auto& dw = layers_[L].deltanet;
     auto& st = delta_states_[L];
 
     float* qkv_z = scratch_qkv_;
-    if (!ane_matvec(ane_layers_[L].first_proj, qkv_z, x,
-                    hidden_size_, lin_qkv_dim_ + lin_total_val_)) {
-        fprintf(stderr, "ANE first_proj eval failed at layer %d (DeltaNet)\n", L);
+    if (!predict_matvec(L, OP_FIRST_PROJ, qkv_z, x,
+                        hidden_size_, lin_qkv_dim_ + lin_total_val_)) {
+        fprintf(stderr, "first_proj eval failed at layer %d (DeltaNet)\n", L);
         return false;
     }
 
@@ -618,9 +736,9 @@ bool Qwen35Model::forward_full_attn_core(int L, float* x, float* pre_oproj, int 
     auto& cache = kv_caches_[L];
 
     float* qkv_buf = scratch_qkv_;
-    if (!ane_matvec(ane_layers_[L].first_proj, qkv_buf, x,
-                    hidden_size_, full_q_dim_ + full_kv_dim_ * 2)) {
-        fprintf(stderr, "ANE first_proj eval failed at layer %d (FullAttn)\n", L);
+    if (!predict_matvec(L, OP_FIRST_PROJ, qkv_buf, x,
+                        hidden_size_, full_q_dim_ + full_kv_dim_ * 2)) {
+        fprintf(stderr, "first_proj eval failed at layer %d (FullAttn)\n", L);
         return false;
     }
 
@@ -697,11 +815,11 @@ float* Qwen35Model::forward(int token, int pos) {
             if (!forward_full_attn_core(L, x_norm_, pre_oproj, pos)) return nullptr;
         }
 
-        // O projection (ANE)
+        // O projection
         int attn_dim = (layer_types_[L] == LayerType::LinearAttention) ? lin_total_val_ : full_out_dim_;
         float* attn_out = x_norm_;
-        if (!ane_matvec(ane_layers_[L].o_proj, attn_out, pre_oproj, attn_dim, hidden_size_)) {
-            fprintf(stderr, "ANE o_proj eval failed at layer %d\n", L);
+        if (!predict_matvec(L, OP_O_PROJ, attn_out, pre_oproj, attn_dim, hidden_size_)) {
+            fprintf(stderr, "o_proj eval failed at layer %d\n", L);
             return nullptr;
         }
 
@@ -711,10 +829,10 @@ float* Qwen35Model::forward(int token, int pos) {
         // Post-attention norm
         rmsnorm(x_norm_, x_, layers_[L].post_attention_layernorm, hidden_size_, rms_eps_);
 
-        // Fused FFN (ANE)
+        // Fused FFN
         float* mlp_out = scratch_attn_;
-        if (!ane_matvec(ane_layers_[L].fused_ffn, mlp_out, x_norm_, hidden_size_, hidden_size_)) {
-            fprintf(stderr, "ANE fused_ffn eval failed at layer %d\n", L);
+        if (!predict_matvec(L, OP_FUSED_FFN, mlp_out, x_norm_, hidden_size_, hidden_size_)) {
+            fprintf(stderr, "fused_ffn eval failed at layer %d\n", L);
             return nullptr;
         }
 
@@ -726,7 +844,26 @@ float* Qwen35Model::forward(int token, int pos) {
     rmsnorm(x_, x_, final_norm_, hidden_size_, rms_eps_);
 
     // LM head
-    if (ane_lm_head_enabled_ && !lm_head_kernels_.empty()) {
+    if (use_coreml_ && !coreml_lm_head_.empty()) {
+        bool ok = true;
+        int chunks = (int)coreml_lm_head_.size();
+        for (int c = 0; c < chunks; c++) {
+            int offset = c * lm_head_chunk_;
+            int rows = vocab_size_ - offset;
+            if (rows > lm_head_chunk_) rows = lm_head_chunk_;
+            if (!coreml_predict(coreml_lm_head_[c], logits_ + offset, x_, hidden_size_, rows)) {
+                fprintf(stderr, "CoreML LM head eval failed at chunk %d/%d, falling back to CPU\n", c + 1, chunks);
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) {
+            for (auto* k : coreml_lm_head_) coreml_free(k);
+            coreml_lm_head_.clear();
+            ane_lm_head_enabled_ = false;
+            matvec(logits_, embed_tokens_, x_, vocab_size_, hidden_size_);
+        }
+    } else if (!use_coreml_ && ane_lm_head_enabled_ && !lm_head_kernels_.empty()) {
         bool ok = true;
         int chunks = (int)lm_head_kernels_.size();
         for (int c = 0; c < chunks; c++) {
