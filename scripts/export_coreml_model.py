@@ -42,7 +42,9 @@ from safetensors import safe_open
 LUT6_CONFIG = OptimizationConfig(global_config=OpPalettizerConfig(nbits=6))
 
 # Max chunk size for LM head (matches C++ LM_HEAD_ANE_CHUNK_MAX)
-LM_HEAD_CHUNK_MAX = 16384
+# Larger chunks = fewer CoreML calls = lower per-token overhead.
+# 262144 covers 248K vocab in a single chunk for 0.8B model.
+LM_HEAD_CHUNK_MAX = 262144
 
 
 class FusedFFN(nn.Module):
