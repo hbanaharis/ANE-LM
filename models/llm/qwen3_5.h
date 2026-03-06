@@ -23,6 +23,8 @@ public:
     virtual float* forward(int token_id, int pos) = 0;
     virtual void reset() = 0;
     virtual int vocab_size() const = 0;
+    virtual void set_timing(bool enabled) { (void)enabled; }
+    virtual void print_timing() {}
 };
 
 // Model-owned config (mirrors mlx-lm.cpp style)
@@ -65,6 +67,8 @@ public:
     float* forward(int token_id, int pos) override;
     void reset() override;
     int vocab_size() const override { return vocab_size_; }
+    void set_timing(bool enabled) override { timing_enabled_ = enabled; }
+    void print_timing() override;
 
 private:
     // Config
@@ -152,8 +156,9 @@ private:
     bool use_coreml_ = false;
     struct LayerCoreMLKernels {
         CoreMLKernel* first_proj = nullptr;
-        CoreMLKernel* o_proj = nullptr;
-        CoreMLKernel* fused_ffn = nullptr;
+        CoreMLKernel* o_proj = nullptr;       // legacy (non-fused)
+        CoreMLKernel* fused_ffn = nullptr;    // legacy (non-fused)
+        CoreMLKernel2* post_attn = nullptr;   // fused: o_proj + residual + norm + FFN + residual
     };
     std::vector<LayerCoreMLKernels> coreml_layers_;
     std::vector<CoreMLKernel*> coreml_lm_head_;
@@ -193,6 +198,18 @@ private:
 
     bool forward_deltanet_core(int L, float* x, float* pre_oproj);
     bool forward_full_attn_core(int L, float* x, float* pre_oproj, int pos);
+
+    // Per-layer timing
+    bool timing_enabled_ = false;
+    struct ForwardTimings {
+        double first_proj_us = 0;
+        double post_attn_us = 0;   // fused: o_proj + norm + FFN
+        double o_proj_us = 0;      // legacy separate
+        double ffn_us = 0;         // legacy separate
+        double cpu_us = 0;         // attention core + norms + residuals
+        double lm_head_us = 0;
+        int count = 0;
+    } timings_;
 };
 
 } // namespace ane_lm

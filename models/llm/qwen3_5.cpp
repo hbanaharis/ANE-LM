@@ -3,8 +3,16 @@
 #include <cmath>
 #include <fstream>
 #include <sys/stat.h>
+#include <mach/mach_time.h>
 
 namespace ane_lm {
+
+// Convert mach_absolute_time ticks to microseconds
+static double to_us(uint64_t elapsed) {
+    static mach_timebase_info_data_t info = {};
+    if (info.denom == 0) mach_timebase_info(&info);
+    return (double)elapsed * info.numer / info.denom / 1000.0;
+}
 
 using json = nlohmann::json;
 
@@ -117,6 +125,7 @@ Qwen35Model::~Qwen35Model() {
         coreml_free(cl.first_proj);
         coreml_free(cl.o_proj);
         coreml_free(cl.fused_ffn);
+        coreml_free_2input(cl.post_attn);
     }
     for (auto* k : coreml_lm_head_) coreml_free(k);
 
@@ -593,24 +602,38 @@ bool Qwen35Model::compile_coreml(const std::string& coreml_dir) {
             return false;
         }
 
-        // o_proj
-        std::string o_proj_path = coreml_dir + "/layer_" + std::to_string(L) + "_o_proj.mlpackage";
+        // Try fused post_attn first, fall back to separate o_proj + fused_ffn
         int attn_dim = (layer_types_[L] == LayerType::LinearAttention) ? lin_total_val_ : full_out_dim_;
-        coreml_layers_[L].o_proj = coreml_load(o_proj_path, attn_dim, hidden_size_);
-        if (!coreml_layers_[L].o_proj) {
-            fprintf(stderr, "CoreML o_proj load failed for layer %d\n", L);
-            return false;
-        }
+        std::string post_attn_path = coreml_dir + "/layer_" + std::to_string(L) + "_post_attn.mlpackage";
+        struct stat pa_st;
+        if (stat(post_attn_path.c_str(), &pa_st) == 0) {
+            // Fused post_attn model available
+            coreml_layers_[L].post_attn = coreml_load_2input(post_attn_path, attn_dim, hidden_size_, hidden_size_);
+            if (!coreml_layers_[L].post_attn) {
+                fprintf(stderr, "CoreML post_attn load failed for layer %d\n", L);
+                return false;
+            }
+        } else {
+            // Legacy: separate o_proj + fused_ffn
+            std::string o_proj_path = coreml_dir + "/layer_" + std::to_string(L) + "_o_proj.mlpackage";
+            coreml_layers_[L].o_proj = coreml_load(o_proj_path, attn_dim, hidden_size_);
+            if (!coreml_layers_[L].o_proj) {
+                fprintf(stderr, "CoreML o_proj load failed for layer %d\n", L);
+                return false;
+            }
 
-        // fused_ffn
-        std::string ffn_path = coreml_dir + "/layer_" + std::to_string(L) + "_fused_ffn.mlpackage";
-        coreml_layers_[L].fused_ffn = coreml_load(ffn_path, hidden_size_, hidden_size_);
-        if (!coreml_layers_[L].fused_ffn) {
-            fprintf(stderr, "CoreML fused_ffn load failed for layer %d\n", L);
-            return false;
+            std::string ffn_path = coreml_dir + "/layer_" + std::to_string(L) + "_fused_ffn.mlpackage";
+            coreml_layers_[L].fused_ffn = coreml_load(ffn_path, hidden_size_, hidden_size_);
+            if (!coreml_layers_[L].fused_ffn) {
+                fprintf(stderr, "CoreML fused_ffn load failed for layer %d\n", L);
+                return false;
+            }
         }
     }
-    LOG("  %d CoreML layer models loaded\n", num_layers_ * 3);
+    bool has_fused = coreml_layers_[0].post_attn != nullptr;
+    LOG("  %d CoreML layer models loaded (%s)\n",
+        num_layers_ * (has_fused ? 2 : 3),
+        has_fused ? "fused" : "legacy");
 
     // LM head chunks
     for (int c = 0; ; c++) {
@@ -643,6 +666,10 @@ bool Qwen35Model::compile_coreml(const std::string& coreml_dir) {
 
 bool Qwen35Model::predict_matvec(int layer, int op, float* output, const float* input,
                                   int in_dim, int out_dim) {
+    uint64_t t0 = 0;
+    if (timing_enabled_ && op == OP_FIRST_PROJ) t0 = mach_absolute_time();
+
+    bool ok;
     if (use_coreml_) {
         CoreMLKernel* k = nullptr;
         switch (op) {
@@ -650,7 +677,7 @@ bool Qwen35Model::predict_matvec(int layer, int op, float* output, const float* 
             case OP_O_PROJ:     k = coreml_layers_[layer].o_proj;     break;
             case OP_FUSED_FFN:  k = coreml_layers_[layer].fused_ffn;  break;
         }
-        return coreml_predict(k, output, input, in_dim, out_dim);
+        ok = coreml_predict(k, output, input, in_dim, out_dim);
     } else {
         ANEKernel* k = nullptr;
         switch (op) {
@@ -658,8 +685,13 @@ bool Qwen35Model::predict_matvec(int layer, int op, float* output, const float* 
             case OP_O_PROJ:     k = ane_layers_[layer].o_proj;     break;
             case OP_FUSED_FFN:  k = ane_layers_[layer].fused_ffn;  break;
         }
-        return ane_matvec(k, output, input, in_dim, out_dim);
+        ok = ane_matvec(k, output, input, in_dim, out_dim);
     }
+
+    if (timing_enabled_ && op == OP_FIRST_PROJ) {
+        timings_.first_proj_us += to_us(mach_absolute_time() - t0);
+    }
+    return ok;
 }
 
 bool Qwen35Model::forward_deltanet_core(int L, float* x, float* pre_oproj) {
@@ -799,6 +831,9 @@ bool Qwen35Model::forward_full_attn_core(int L, float* x, float* pre_oproj, int 
 }
 
 float* Qwen35Model::forward(int token, int pos) {
+    uint64_t t0 = 0, t1 = 0;
+    bool do_timing = timing_enabled_ && pos > 0;  // skip prompt tokens for cleaner averages
+
     // Embedding lookup
     memcpy(x_, embed_tokens_ + (int64_t)token * hidden_size_, hidden_size_ * sizeof(float));
 
@@ -806,44 +841,82 @@ float* Qwen35Model::forward(int token, int pos) {
 
     for (int L = 0; L < num_layers_; L++) {
         // Pre-attention norm
+        if (do_timing) t0 = mach_absolute_time();
         rmsnorm(x_norm_, x_, layers_[L].input_layernorm, hidden_size_, rms_eps_);
 
-        // Attention core
+        // Attention core (first_proj ANE call happens inside)
         if (layer_types_[L] == LayerType::LinearAttention) {
             if (!forward_deltanet_core(L, x_norm_, pre_oproj)) return nullptr;
         } else {
             if (!forward_full_attn_core(L, x_norm_, pre_oproj, pos)) return nullptr;
         }
+        if (do_timing) {
+            t1 = mach_absolute_time();
+            timings_.cpu_us += to_us(t1 - t0);
+        }
 
-        // O projection
         int attn_dim = (layer_types_[L] == LayerType::LinearAttention) ? lin_total_val_ : full_out_dim_;
-        float* attn_out = x_norm_;
-        if (!predict_matvec(L, OP_O_PROJ, attn_out, pre_oproj, attn_dim, hidden_size_)) {
-            fprintf(stderr, "o_proj eval failed at layer %d\n", L);
-            return nullptr;
+
+        if (use_coreml_ && coreml_layers_[L].post_attn) {
+            // Fused path: o_proj + residual + norm + FFN + residual in one ANE call
+            if (do_timing) t0 = mach_absolute_time();
+
+            if (!coreml_predict_2input(coreml_layers_[L].post_attn,
+                                        x_norm_,      // output buffer
+                                        pre_oproj,    // input 1: attention output
+                                        x_,           // input 2: residual
+                                        attn_dim, hidden_size_, hidden_size_)) {
+                fprintf(stderr, "post_attn eval failed at layer %d\n", L);
+                return nullptr;
+            }
+
+            memcpy(x_, x_norm_, hidden_size_ * sizeof(float));
+            if (do_timing) {
+                t1 = mach_absolute_time();
+                timings_.post_attn_us += to_us(t1 - t0);
+            }
+        } else {
+            // Legacy path: separate o_proj + norm + FFN
+            float* attn_out = x_norm_;
+            if (do_timing) t0 = mach_absolute_time();
+            if (!predict_matvec(L, OP_O_PROJ, attn_out, pre_oproj, attn_dim, hidden_size_)) {
+                fprintf(stderr, "o_proj eval failed at layer %d\n", L);
+                return nullptr;
+            }
+            if (do_timing) {
+                t1 = mach_absolute_time();
+                timings_.o_proj_us += to_us(t1 - t0);
+            }
+
+            // Residual 1
+            for (int i = 0; i < hidden_size_; i++) x_[i] += attn_out[i];
+
+            // Post-attention norm
+            rmsnorm(x_norm_, x_, layers_[L].post_attention_layernorm, hidden_size_, rms_eps_);
+
+            // Fused FFN
+            float* mlp_out = scratch_attn_;
+            if (do_timing) t0 = mach_absolute_time();
+            if (!predict_matvec(L, OP_FUSED_FFN, mlp_out, x_norm_, hidden_size_, hidden_size_)) {
+                fprintf(stderr, "fused_ffn eval failed at layer %d\n", L);
+                return nullptr;
+            }
+            if (do_timing) {
+                t1 = mach_absolute_time();
+                timings_.ffn_us += to_us(t1 - t0);
+            }
+
+            // Residual 2
+            for (int i = 0; i < hidden_size_; i++) x_[i] += mlp_out[i];
+
         }
-
-        // Residual 1
-        for (int i = 0; i < hidden_size_; i++) x_[i] += attn_out[i];
-
-        // Post-attention norm
-        rmsnorm(x_norm_, x_, layers_[L].post_attention_layernorm, hidden_size_, rms_eps_);
-
-        // Fused FFN
-        float* mlp_out = scratch_attn_;
-        if (!predict_matvec(L, OP_FUSED_FFN, mlp_out, x_norm_, hidden_size_, hidden_size_)) {
-            fprintf(stderr, "fused_ffn eval failed at layer %d\n", L);
-            return nullptr;
-        }
-
-        // Residual 2
-        for (int i = 0; i < hidden_size_; i++) x_[i] += mlp_out[i];
     }
 
     // Final norm
     rmsnorm(x_, x_, final_norm_, hidden_size_, rms_eps_);
 
     // LM head
+    if (do_timing) t0 = mach_absolute_time();
     if (use_coreml_ && !coreml_lm_head_.empty()) {
         bool ok = true;
         int chunks = (int)coreml_lm_head_.size();
@@ -883,8 +956,54 @@ float* Qwen35Model::forward(int token, int pos) {
     } else {
         matvec(logits_, embed_tokens_, x_, vocab_size_, hidden_size_);
     }
+    if (do_timing) {
+        t1 = mach_absolute_time();
+        timings_.lm_head_us += to_us(t1 - t0);
+    }
+
+    if (do_timing) timings_.count++;
 
     return logits_;
+}
+
+void Qwen35Model::print_timing() {
+    if (timings_.count == 0) return;
+    int n = timings_.count;
+    bool fused = (coreml_layers_.size() > 0 && coreml_layers_[0].post_attn != nullptr);
+
+    fprintf(stderr, "\n--- Per-token timing (avg over %d gen tokens, %d layers) ---\n", n, num_layers_);
+
+    // cpu_us includes first_proj time (called inside forward_*_core)
+    // Subtract first_proj to get pure CPU time
+    double first_proj_avg = timings_.first_proj_us / n;
+    double cpu_raw_avg = timings_.cpu_us / n;
+    double cpu_pure_avg = cpu_raw_avg - first_proj_avg;
+    double lm_head_avg = timings_.lm_head_us / n;
+
+    fprintf(stderr, "  first_proj:   %7.2f ms/token  (%.2f ms/call x %d)\n",
+            first_proj_avg / 1000.0, first_proj_avg / 1000.0 / num_layers_, num_layers_);
+    fprintf(stderr, "  cpu (attn):   %7.2f ms/token\n", cpu_pure_avg / 1000.0);
+
+    if (fused) {
+        double post_attn_avg = timings_.post_attn_us / n;
+        double total = first_proj_avg + cpu_pure_avg + post_attn_avg + lm_head_avg;
+        fprintf(stderr, "  post_attn:    %7.2f ms/token  (%.2f ms/call x %d)\n",
+                post_attn_avg / 1000.0, post_attn_avg / 1000.0 / num_layers_, num_layers_);
+        fprintf(stderr, "  lm_head:      %7.2f ms/token\n", lm_head_avg / 1000.0);
+        fprintf(stderr, "  total:        %7.2f ms/token -> %.1f tok/s\n",
+                total / 1000.0, 1000000.0 / total);
+    } else {
+        double o_proj_avg = timings_.o_proj_us / n;
+        double ffn_avg = timings_.ffn_us / n;
+        double total = first_proj_avg + cpu_pure_avg + o_proj_avg + ffn_avg + lm_head_avg;
+        fprintf(stderr, "  o_proj:       %7.2f ms/token  (%.2f ms/call x %d)\n",
+                o_proj_avg / 1000.0, o_proj_avg / 1000.0 / num_layers_, num_layers_);
+        fprintf(stderr, "  fused_ffn:    %7.2f ms/token  (%.2f ms/call x %d)\n",
+                ffn_avg / 1000.0, ffn_avg / 1000.0 / num_layers_, num_layers_);
+        fprintf(stderr, "  lm_head:      %7.2f ms/token\n", lm_head_avg / 1000.0);
+        fprintf(stderr, "  total:        %7.2f ms/token -> %.1f tok/s\n",
+                total / 1000.0, 1000000.0 / total);
+    }
 }
 
 } // namespace ane_lm

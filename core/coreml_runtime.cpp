@@ -358,4 +358,242 @@ void coreml_free(CoreMLKernel* k) {
     delete k;
 }
 
+// ============ 2-Input CoreML API ============
+
+struct CoreMLKernel2 {
+    id model;
+    id inputArray1;     // MLMultiArray* (pre-allocated, reused)
+    id inputArray2;     // MLMultiArray* (pre-allocated, reused)
+    id provider;        // MLDictionaryFeatureProvider* (cached, reused)
+    id outputFeature;   // Cached output feature name (NSString*)
+    int in1_dim;
+    int in2_dim;
+    int out_dim;
+    bool output_fp16;
+};
+
+CoreMLKernel2* coreml_load_2input(const std::string& model_path,
+                                    int in1_dim, int in2_dim, int out_dim,
+                                    int compute_unit) {
+    void* pool = objc_autoreleasePoolPush();
+
+    // Compile/load model (same logic as single-input)
+    id compiled_url = nil;
+    bool is_mlpackage = model_path.size() > 10 &&
+        model_path.substr(model_path.size() - 10) == ".mlpackage";
+
+    if (is_mlpackage) {
+        std::string cache_path = cached_mlmodelc_path(model_path);
+        if (dir_exists(cache_path) && path_mtime(cache_path) >= path_mtime(model_path)) {
+            compiled_url = ((id(*)(Class,SEL,id))objc_msgSend)(
+                cls("NSURL"), sel("fileURLWithPath:"), ns_str(cache_path.c_str()));
+        } else {
+            id url = ((id(*)(Class,SEL,id))objc_msgSend)(
+                cls("NSURL"), sel("fileURLWithPath:"), ns_str(model_path.c_str()));
+            id err = nil;
+            id temp_url = ((id(*)(Class,SEL,id,id*))objc_msgSend)(
+                cls("MLModel"), sel("compileModelAtURL:error:"), url, &err);
+            if (err || !temp_url) {
+                const char* desc = err ?
+                    ((const char*(*)(id,SEL))objc_msgSend)(
+                        ((id(*)(id,SEL))objc_msgSend)(err, sel("localizedDescription")),
+                        sel("UTF8String")) : "nil";
+                fprintf(stderr, "[CoreML] Compilation failed for %s: %s\n",
+                        model_path.c_str(), desc);
+                objc_autoreleasePoolPop(pool);
+                return nullptr;
+            }
+            std::string temp_path = nsurl_to_path(temp_url);
+            if (dir_exists(cache_path)) {
+                id fm = ((id(*)(Class,SEL))objc_msgSend)(cls("NSFileManager"), sel("defaultManager"));
+                ((bool(*)(id,SEL,id,id*))objc_msgSend)(
+                    fm, sel("removeItemAtPath:error:"), ns_str(cache_path.c_str()), (id*)nullptr);
+            }
+            if (copy_dir(temp_path, cache_path)) {
+                compiled_url = ((id(*)(Class,SEL,id))objc_msgSend)(
+                    cls("NSURL"), sel("fileURLWithPath:"), ns_str(cache_path.c_str()));
+            } else {
+                compiled_url = temp_url;
+            }
+        }
+    } else {
+        compiled_url = ((id(*)(Class,SEL,id))objc_msgSend)(
+            cls("NSURL"), sel("fileURLWithPath:"), ns_str(model_path.c_str()));
+    }
+
+    // Create configuration
+    id config = ((id(*)(id,SEL))objc_msgSend)(
+        ((id(*)(Class,SEL))objc_msgSend)(cls("MLModelConfiguration"), sel("alloc")),
+        sel("init"));
+    ((void(*)(id,SEL,long))objc_msgSend)(config, sel("setComputeUnits:"), (long)compute_unit);
+
+    // Load model
+    id err = nil;
+    id model = ((id(*)(Class,SEL,id,id,id*))objc_msgSend)(
+        cls("MLModel"), sel("modelWithContentsOfURL:configuration:error:"),
+        compiled_url, config, &err);
+    if (err || !model) {
+        const char* desc = err ?
+            ((const char*(*)(id,SEL))objc_msgSend)(
+                ((id(*)(id,SEL))objc_msgSend)(err, sel("localizedDescription")),
+                sel("UTF8String")) : "nil model";
+        fprintf(stderr, "[CoreML] Failed to load 2-input model %s: %s\n", model_path.c_str(), desc);
+        objc_autoreleasePoolPop(pool);
+        return nullptr;
+    }
+    ((id(*)(id,SEL))objc_msgSend)(model, sel("retain"));
+
+    // Get input/output feature names from model description
+    id desc = ((id(*)(id,SEL))objc_msgSend)(model, sel("modelDescription"));
+    id inputDescs = ((id(*)(id,SEL))objc_msgSend)(desc, sel("inputDescriptionsByName"));
+    id outputDescs = ((id(*)(id,SEL))objc_msgSend)(desc, sel("outputDescriptionsByName"));
+
+    id inputKeys = ((id(*)(id,SEL))objc_msgSend)(inputDescs, sel("allKeys"));
+    id outputKeys = ((id(*)(id,SEL))objc_msgSend)(outputDescs, sel("allKeys"));
+
+    // Get the two input names (sorted to ensure consistent ordering)
+    id sortedInputKeys = ((id(*)(id,SEL,SEL))objc_msgSend)(inputKeys, sel("sortedArrayUsingSelector:"),
+        sel("compare:"));
+    id inputName1 = ((id(*)(id,SEL,unsigned long))objc_msgSend)(sortedInputKeys, sel("objectAtIndex:"), 0UL);
+    id inputName2 = ((id(*)(id,SEL,unsigned long))objc_msgSend)(sortedInputKeys, sel("objectAtIndex:"), 1UL);
+    id outputName = ((id(*)(id,SEL,unsigned long))objc_msgSend)(outputKeys, sel("objectAtIndex:"), 0UL);
+
+    // Determine which input is which based on names
+    // Our export uses "attn_output" and "x_residual"
+    // After sorting: "attn_output" < "x_residual"
+    // So sorted[0] = attn_output (in1_dim), sorted[1] = x_residual (in2_dim)
+    int dim_for_name1 = in1_dim;  // attn_output
+    int dim_for_name2 = in2_dim;  // x_residual
+
+    // Pre-allocate input MLMultiArrays
+    id inputArray1 = create_multi_array(dim_for_name1);
+    id inputArray2 = create_multi_array(dim_for_name2);
+    if (!inputArray1 || !inputArray2) {
+        ((void(*)(id,SEL))objc_msgSend)(model, sel("release"));
+        objc_autoreleasePoolPop(pool);
+        return nullptr;
+    }
+    ((id(*)(id,SEL))objc_msgSend)(inputArray1, sel("retain"));
+    ((id(*)(id,SEL))objc_msgSend)(inputArray2, sel("retain"));
+
+    // Build cached feature provider with two inputs
+    id featureValue1 = ((id(*)(Class,SEL,id))objc_msgSend)(
+        cls("MLFeatureValue"), sel("featureValueWithMultiArray:"), inputArray1);
+    id featureValue2 = ((id(*)(Class,SEL,id))objc_msgSend)(
+        cls("MLFeatureValue"), sel("featureValueWithMultiArray:"), inputArray2);
+    ((id(*)(id,SEL))objc_msgSend)(featureValue1, sel("retain"));
+    ((id(*)(id,SEL))objc_msgSend)(featureValue2, sel("retain"));
+
+    id fKeys[] = { inputName1, inputName2 };
+    id fValues[] = { featureValue1, featureValue2 };
+    id dict = ((id(*)(Class,SEL,id*,id*,unsigned long))objc_msgSend)(
+        cls("NSDictionary"), sel("dictionaryWithObjects:forKeys:count:"),
+        fValues, fKeys, 2UL);
+
+    id providerErr = nil;
+    id provider = ((id(*)(id,SEL,id,id*))objc_msgSend)(
+        ((id(*)(Class,SEL))objc_msgSend)(cls("MLDictionaryFeatureProvider"), sel("alloc")),
+        sel("initWithDictionary:error:"),
+        dict, &providerErr);
+
+    if (providerErr || !provider) {
+        fprintf(stderr, "[CoreML] Failed to create 2-input cached feature provider\n");
+        ((void(*)(id,SEL))objc_msgSend)(featureValue1, sel("release"));
+        ((void(*)(id,SEL))objc_msgSend)(featureValue2, sel("release"));
+        ((void(*)(id,SEL))objc_msgSend)(inputArray1, sel("release"));
+        ((void(*)(id,SEL))objc_msgSend)(inputArray2, sel("release"));
+        ((void(*)(id,SEL))objc_msgSend)(model, sel("release"));
+        objc_autoreleasePoolPop(pool);
+        return nullptr;
+    }
+    ((id(*)(id,SEL))objc_msgSend)(provider, sel("retain"));
+    ((id(*)(id,SEL))objc_msgSend)(outputName, sel("retain"));
+
+    // Probe output data type with a dummy prediction
+    bool output_fp16 = false;
+    {
+        id probeErr = nil;
+        id probeResult = ((id(*)(id,SEL,id,id*))objc_msgSend)(
+            model, sel("predictionFromFeatures:error:"),
+            provider, &probeErr);
+        if (probeResult) {
+            id outFeat = ((id(*)(id,SEL,id))objc_msgSend)(
+                probeResult, sel("featureValueForName:"), outputName);
+            id outArr = ((id(*)(id,SEL))objc_msgSend)(outFeat, sel("multiArrayValue"));
+            output_fp16 = (multi_array_data_type(outArr) == kMLDataTypeFloat16);
+        }
+    }
+
+    CoreMLKernel2* k = new CoreMLKernel2();
+    k->model = model;
+    k->inputArray1 = inputArray1;
+    k->inputArray2 = inputArray2;
+    k->provider = provider;
+    k->outputFeature = outputName;
+    k->in1_dim = dim_for_name1;
+    k->in2_dim = dim_for_name2;
+    k->out_dim = out_dim;
+    k->output_fp16 = output_fp16;
+
+    objc_autoreleasePoolPop(pool);
+    return k;
+}
+
+bool coreml_predict_2input(CoreMLKernel2* k, float* output,
+                            const float* input1, const float* input2,
+                            int in1_dim, int in2_dim, int out_dim) {
+    void* pool = objc_autoreleasePoolPush();
+
+    // Copy both inputs to pre-allocated MLMultiArrays
+    float* in1_ptr = (float*)multi_array_data_ptr(k->inputArray1);
+    memcpy(in1_ptr, input1, in1_dim * sizeof(float));
+
+    float* in2_ptr = (float*)multi_array_data_ptr(k->inputArray2);
+    memcpy(in2_ptr, input2, in2_dim * sizeof(float));
+
+    // Run prediction using cached provider
+    id err = nil;
+    id result = ((id(*)(id,SEL,id,id*))objc_msgSend)(
+        k->model, sel("predictionFromFeatures:error:"),
+        k->provider, &err);
+
+    if (!result) {
+        if (err) {
+            const char* desc = ((const char*(*)(id,SEL))objc_msgSend)(
+                ((id(*)(id,SEL))objc_msgSend)(err, sel("localizedDescription")),
+                sel("UTF8String"));
+            fprintf(stderr, "[CoreML] 2-input prediction failed: %s\n", desc);
+        }
+        objc_autoreleasePoolPop(pool);
+        return false;
+    }
+
+    // Extract output
+    id outFeature = ((id(*)(id,SEL,id))objc_msgSend)(
+        result, sel("featureValueForName:"), k->outputFeature);
+    id outArray = ((id(*)(id,SEL))objc_msgSend)(outFeature, sel("multiArrayValue"));
+    void* out_ptr = multi_array_data_ptr(outArray);
+
+    if (k->output_fp16) {
+        vImage_Buffer src = { out_ptr, 1, (unsigned long)out_dim, (unsigned long)(out_dim * 2) };
+        vImage_Buffer dst = { output,  1, (unsigned long)out_dim, (unsigned long)(out_dim * 4) };
+        vImageConvert_Planar16FtoPlanarF(&src, &dst, 0);
+    } else {
+        memcpy(output, out_ptr, out_dim * sizeof(float));
+    }
+
+    objc_autoreleasePoolPop(pool);
+    return true;
+}
+
+void coreml_free_2input(CoreMLKernel2* k) {
+    if (!k) return;
+    ((void(*)(id,SEL))objc_msgSend)(k->provider, sel("release"));
+    ((void(*)(id,SEL))objc_msgSend)(k->inputArray1, sel("release"));
+    ((void(*)(id,SEL))objc_msgSend)(k->inputArray2, sel("release"));
+    ((void(*)(id,SEL))objc_msgSend)(k->outputFeature, sel("release"));
+    ((void(*)(id,SEL))objc_msgSend)(k->model, sel("release"));
+    delete k;
+}
+
 } // namespace ane_lm

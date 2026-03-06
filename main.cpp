@@ -60,6 +60,7 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  --repeat-penalty P Repetition penalty (default: 1.2, 1.0=off)\n");
     fprintf(stderr, "  --enable-thinking Enable thinking/reasoning mode\n");
     fprintf(stderr, "  --backend <name>  Compute backend: ane (default) or coreml\n");
+    fprintf(stderr, "  --timing          Print per-layer timing breakdown after generation\n");
     fprintf(stderr, "  --no-ane-cache    Disable persistent ANE compile cache\n");
     fprintf(stderr, "  -v, --verbose     Show detailed initialization info\n");
     fprintf(stderr, "\nExamples:\n");
@@ -78,6 +79,7 @@ struct Args {
     float repetition_penalty = 1.2f;
     bool ane_cache = true;
     bool enable_thinking = false;
+    bool timing = false;
 };
 
 static Args parse_args(int argc, char* argv[], int start) {
@@ -99,6 +101,8 @@ static Args parse_args(int argc, char* argv[], int start) {
             args.socket_path = argv[++i];
         } else if (strcmp(argv[i], "--enable-thinking") == 0) {
             args.enable_thinking = true;
+        } else if (strcmp(argv[i], "--timing") == 0) {
+            args.timing = true;
         } else if (strcmp(argv[i], "--no-ane-cache") == 0) {
             args.ane_cache = false;
         } else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
@@ -110,6 +114,8 @@ static Args parse_args(int argc, char* argv[], int start) {
 
 static int cmd_generate(LLMModel& model, Tokenizer& tokenizer, const Args& args) {
     LOG("Prompt: \"%s\"\n", args.prompt);
+
+    if (args.timing) model.set_timing(true);
 
     SamplingParams sampling;
     sampling.temperature = args.temperature;
@@ -136,6 +142,8 @@ static int cmd_generate(LLMModel& model, Tokenizer& tokenizer, const Args& args)
             last.prompt_tokens, last.prompt_tps);
     fprintf(stderr, "Generation: %d tokens, %.3f tokens-per-sec\n",
             last.generation_tokens, last.generation_tps);
+
+    if (args.timing) model.print_timing();
     return 0;
 }
 
