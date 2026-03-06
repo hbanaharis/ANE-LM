@@ -6,8 +6,10 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <sys/stat.h>
 #include "coreml_runtime.h"
 #include <ane_lm/common.h>
+#include <Accelerate/Accelerate.h>
 
 // MLMultiArrayDataType enum values
 static constexpr long kMLDataTypeFloat16 = 65552;  // 0x10010
@@ -38,10 +40,11 @@ static id ns_number_int(int v) {
 struct CoreMLKernel {
     id model;           // MLModel*
     id inputArray;      // MLMultiArray* (pre-allocated, reused)
+    id provider;        // MLDictionaryFeatureProvider* (cached, reused)
     id outputFeature;   // Cached output feature name (NSString*)
-    id inputFeature;    // Cached input feature name (NSString*)
     int in_dim;
     int out_dim;
+    bool output_fp16;   // Whether output MLMultiArray is FP16
 };
 
 // ============ MLMultiArray helpers ============
@@ -79,6 +82,58 @@ static long multi_array_data_type(id array) {
     return ((long(*)(id,SEL))objc_msgSend)(array, sel("dataType"));
 }
 
+// ============ Disk cache helpers ============
+
+// Return path to cached .mlmodelc for a given .mlpackage
+// Cache location: same directory, replacing .mlpackage with .mlmodelc
+static std::string cached_mlmodelc_path(const std::string& mlpackage_path) {
+    // models/Qwen3.5-0.8B-coreml/layer_0_first_proj.mlpackage
+    //   → models/Qwen3.5-0.8B-coreml/layer_0_first_proj.mlmodelc
+    std::string base = mlpackage_path.substr(0, mlpackage_path.size() - 10); // strip .mlpackage
+    return base + ".mlmodelc";
+}
+
+// Check if path exists and is a directory
+static bool dir_exists(const std::string& path) {
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+// Get modification time of a path (file or directory)
+static time_t path_mtime(const std::string& path) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return 0;
+    return st.st_mtime;
+}
+
+// Copy directory recursively using NSFileManager
+static bool copy_dir(const std::string& src, const std::string& dst) {
+    void* pool = objc_autoreleasePoolPush();
+    id fm = ((id(*)(Class,SEL))objc_msgSend)(cls("NSFileManager"), sel("defaultManager"));
+    id srcStr = ns_str(src.c_str());
+    id dstStr = ns_str(dst.c_str());
+
+    id err = nil;
+    bool ok = ((bool(*)(id,SEL,id,id,id*))objc_msgSend)(
+        fm, sel("copyItemAtPath:toPath:error:"), srcStr, dstStr, &err);
+
+    if (!ok && err) {
+        const char* desc = ((const char*(*)(id,SEL))objc_msgSend)(
+            ((id(*)(id,SEL))objc_msgSend)(err, sel("localizedDescription")),
+            sel("UTF8String"));
+        fprintf(stderr, "[CoreML] Failed to cache compiled model: %s\n", desc);
+    }
+    objc_autoreleasePoolPop(pool);
+    return ok;
+}
+
+// Get the string path from an NSURL
+static std::string nsurl_to_path(id url) {
+    id pathStr = ((id(*)(id,SEL))objc_msgSend)(url, sel("path"));
+    const char* cstr = ((const char*(*)(id,SEL))objc_msgSend)(pathStr, sel("UTF8String"));
+    return std::string(cstr);
+}
+
 // ============ Public API ============
 
 bool coreml_available() {
@@ -89,28 +144,56 @@ CoreMLKernel* coreml_load(const std::string& model_path, int in_dim, int out_dim
                            int compute_unit) {
     void* pool = objc_autoreleasePoolPush();
 
-    // Create NSURL from path
-    id path_str = ns_str(model_path.c_str());
-    id url = ((id(*)(Class,SEL,id))objc_msgSend)(cls("NSURL"), sel("fileURLWithPath:"), path_str);
+    id compiled_url = nil;
+    bool is_mlpackage = model_path.size() > 10 &&
+        model_path.substr(model_path.size() - 10) == ".mlpackage";
 
-    // Compile .mlpackage to .mlmodelc if needed
-    // [MLModel compileModelAtURL:error:] returns URL to compiled model in temp dir
-    id compiled_url = url;
-    if (model_path.size() > 10 &&
-        model_path.substr(model_path.size() - 10) == ".mlpackage") {
-        id err = nil;
-        compiled_url = ((id(*)(Class,SEL,id,id*))objc_msgSend)(
-            cls("MLModel"), sel("compileModelAtURL:error:"), url, &err);
-        if (err || !compiled_url) {
-            const char* desc = err ?
-                ((const char*(*)(id,SEL))objc_msgSend)(
-                    ((id(*)(id,SEL))objc_msgSend)(err, sel("localizedDescription")),
-                    sel("UTF8String")) : "nil";
-            fprintf(stderr, "[CoreML] Compilation failed for %s: %s\n",
-                    model_path.c_str(), desc);
-            objc_autoreleasePoolPop(pool);
-            return nullptr;
+    if (is_mlpackage) {
+        // Check for cached .mlmodelc on disk
+        std::string cache_path = cached_mlmodelc_path(model_path);
+        if (dir_exists(cache_path) && path_mtime(cache_path) >= path_mtime(model_path)) {
+            // Use cached compiled model
+            compiled_url = ((id(*)(Class,SEL,id))objc_msgSend)(
+                cls("NSURL"), sel("fileURLWithPath:"), ns_str(cache_path.c_str()));
+        } else {
+            // Compile and cache
+            id url = ((id(*)(Class,SEL,id))objc_msgSend)(
+                cls("NSURL"), sel("fileURLWithPath:"), ns_str(model_path.c_str()));
+
+            id err = nil;
+            id temp_url = ((id(*)(Class,SEL,id,id*))objc_msgSend)(
+                cls("MLModel"), sel("compileModelAtURL:error:"), url, &err);
+            if (err || !temp_url) {
+                const char* desc = err ?
+                    ((const char*(*)(id,SEL))objc_msgSend)(
+                        ((id(*)(id,SEL))objc_msgSend)(err, sel("localizedDescription")),
+                        sel("UTF8String")) : "nil";
+                fprintf(stderr, "[CoreML] Compilation failed for %s: %s\n",
+                        model_path.c_str(), desc);
+                objc_autoreleasePoolPop(pool);
+                return nullptr;
+            }
+
+            // Copy compiled model from temp dir to persistent cache
+            std::string temp_path = nsurl_to_path(temp_url);
+            // Remove stale cache if exists
+            if (dir_exists(cache_path)) {
+                id fm = ((id(*)(Class,SEL))objc_msgSend)(cls("NSFileManager"), sel("defaultManager"));
+                ((bool(*)(id,SEL,id,id*))objc_msgSend)(
+                    fm, sel("removeItemAtPath:error:"), ns_str(cache_path.c_str()), (id*)nullptr);
+            }
+            if (copy_dir(temp_path, cache_path)) {
+                compiled_url = ((id(*)(Class,SEL,id))objc_msgSend)(
+                    cls("NSURL"), sel("fileURLWithPath:"), ns_str(cache_path.c_str()));
+            } else {
+                // Fallback: use temp URL directly
+                compiled_url = temp_url;
+            }
         }
+    } else {
+        // Already a .mlmodelc or other compiled format
+        compiled_url = ((id(*)(Class,SEL,id))objc_msgSend)(
+            cls("NSURL"), sel("fileURLWithPath:"), ns_str(model_path.c_str()));
     }
 
     // Create MLModelConfiguration
@@ -161,18 +244,62 @@ CoreMLKernel* coreml_load(const std::string& model_path, int in_dim, int out_dim
     }
     ((id(*)(id,SEL))objc_msgSend)(inputArray, sel("retain"));
 
-    // Retain feature names
-    ((id(*)(id,SEL))objc_msgSend)(inputName, sel("retain"));
+    // Build cached feature provider (reused across all predictions)
+    // The provider wraps the same MLMultiArray — updating its dataPointer
+    // contents before each predict() is sufficient.
+    id featureValue = ((id(*)(Class,SEL,id))objc_msgSend)(
+        cls("MLFeatureValue"), sel("featureValueWithMultiArray:"), inputArray);
+    ((id(*)(id,SEL))objc_msgSend)(featureValue, sel("retain"));
+
+    id fKeys[] = { inputName };
+    id fValues[] = { featureValue };
+    id dict = ((id(*)(Class,SEL,id*,id*,unsigned long))objc_msgSend)(
+        cls("NSDictionary"), sel("dictionaryWithObjects:forKeys:count:"),
+        fValues, fKeys, 1UL);
+
+    id providerErr = nil;
+    id provider = ((id(*)(id,SEL,id,id*))objc_msgSend)(
+        ((id(*)(Class,SEL))objc_msgSend)(cls("MLDictionaryFeatureProvider"), sel("alloc")),
+        sel("initWithDictionary:error:"),
+        dict, &providerErr);
+
+    if (providerErr || !provider) {
+        fprintf(stderr, "[CoreML] Failed to create cached feature provider\n");
+        ((void(*)(id,SEL))objc_msgSend)(featureValue, sel("release"));
+        ((void(*)(id,SEL))objc_msgSend)(inputArray, sel("release"));
+        ((void(*)(id,SEL))objc_msgSend)(model, sel("release"));
+        objc_autoreleasePoolPop(pool);
+        return nullptr;
+    }
+    ((id(*)(id,SEL))objc_msgSend)(provider, sel("retain"));
+
+    // Retain output feature name
     ((id(*)(id,SEL))objc_msgSend)(outputName, sel("retain"));
+
+    // Probe output data type with a dummy prediction
+    bool output_fp16 = false;
+    {
+        id probeErr = nil;
+        id probeResult = ((id(*)(id,SEL,id,id*))objc_msgSend)(
+            model, sel("predictionFromFeatures:error:"),
+            provider, &probeErr);
+        if (probeResult) {
+            id outFeat = ((id(*)(id,SEL,id))objc_msgSend)(
+                probeResult, sel("featureValueForName:"), outputName);
+            id outArr = ((id(*)(id,SEL))objc_msgSend)(outFeat, sel("multiArrayValue"));
+            output_fp16 = (multi_array_data_type(outArr) == kMLDataTypeFloat16);
+        }
+    }
 
     // Create kernel
     CoreMLKernel* k = new CoreMLKernel();
     k->model = model;
     k->inputArray = inputArray;
-    k->inputFeature = inputName;
+    k->provider = provider;
     k->outputFeature = outputName;
     k->in_dim = in_dim;
     k->out_dim = out_dim;
+    k->output_fp16 = output_fp16;
 
     objc_autoreleasePoolPop(pool);
     return k;
@@ -186,41 +313,19 @@ bool coreml_predict(CoreMLKernel* k, float* output, const float* input,
     float* in_ptr = (float*)multi_array_data_ptr(k->inputArray);
     memcpy(in_ptr, input, in_dim * sizeof(float));
 
-    // Create MLDictionaryFeatureProvider with input
-    id featureValue = ((id(*)(Class,SEL,id))objc_msgSend)(
-        cls("MLFeatureValue"), sel("featureValueWithMultiArray:"), k->inputArray);
-
-    // Build NSDictionary {inputName: featureValue}
-    id keys[] = { k->inputFeature };
-    id values[] = { featureValue };
-    id dict = ((id(*)(Class,SEL,id*,id*,unsigned long))objc_msgSend)(
-        cls("NSDictionary"), sel("dictionaryWithObjects:forKeys:count:"),
-        values, keys, 1UL);
-
+    // Run prediction using cached provider
     id err = nil;
-    id provider = ((id(*)(id,SEL,id,id*))objc_msgSend)(
-        ((id(*)(Class,SEL))objc_msgSend)(cls("MLDictionaryFeatureProvider"), sel("alloc")),
-        sel("initWithDictionary:error:"),
-        dict, &err);
-
-    if (err || !provider) {
-        fprintf(stderr, "[CoreML] Feature provider creation failed\n");
-        objc_autoreleasePoolPop(pool);
-        return false;
-    }
-
-    // Run prediction
-    err = nil;
     id result = ((id(*)(id,SEL,id,id*))objc_msgSend)(
         k->model, sel("predictionFromFeatures:error:"),
-        provider, &err);
+        k->provider, &err);
 
-    if (err || !result) {
-        const char* desc = err ?
-            ((const char*(*)(id,SEL))objc_msgSend)(
+    if (!result) {
+        if (err) {
+            const char* desc = ((const char*(*)(id,SEL))objc_msgSend)(
                 ((id(*)(id,SEL))objc_msgSend)(err, sel("localizedDescription")),
-                sel("UTF8String")) : "nil result";
-        fprintf(stderr, "[CoreML] Prediction failed: %s\n", desc);
+                sel("UTF8String"));
+            fprintf(stderr, "[CoreML] Prediction failed: %s\n", desc);
+        }
         objc_autoreleasePoolPop(pool);
         return false;
     }
@@ -229,19 +334,14 @@ bool coreml_predict(CoreMLKernel* k, float* output, const float* input,
     id outFeature = ((id(*)(id,SEL,id))objc_msgSend)(
         result, sel("featureValueForName:"), k->outputFeature);
     id outArray = ((id(*)(id,SEL))objc_msgSend)(outFeature, sel("multiArrayValue"));
-
-    // Copy output — handle FP16 output arrays (CoreML models often use FP16)
-    long outType = multi_array_data_type(outArray);
     void* out_ptr = multi_array_data_ptr(outArray);
 
-    if (outType == kMLDataTypeFloat16) {
-        // Convert FP16 → FP32
-        _Float16* fp16 = (_Float16*)out_ptr;
-        for (int i = 0; i < out_dim; i++) {
-            output[i] = (float)fp16[i];
-        }
+    if (k->output_fp16) {
+        // Vectorized FP16 → FP32 via Accelerate
+        vImage_Buffer src = { out_ptr, 1, (unsigned long)out_dim, (unsigned long)(out_dim * 2) };
+        vImage_Buffer dst = { output,  1, (unsigned long)out_dim, (unsigned long)(out_dim * 4) };
+        vImageConvert_Planar16FtoPlanarF(&src, &dst, 0);
     } else {
-        // FP32 — direct copy
         memcpy(output, out_ptr, out_dim * sizeof(float));
     }
 
@@ -251,8 +351,8 @@ bool coreml_predict(CoreMLKernel* k, float* output, const float* input,
 
 void coreml_free(CoreMLKernel* k) {
     if (!k) return;
+    ((void(*)(id,SEL))objc_msgSend)(k->provider, sel("release"));
     ((void(*)(id,SEL))objc_msgSend)(k->inputArray, sel("release"));
-    ((void(*)(id,SEL))objc_msgSend)(k->inputFeature, sel("release"));
     ((void(*)(id,SEL))objc_msgSend)(k->outputFeature, sel("release"));
     ((void(*)(id,SEL))objc_msgSend)(k->model, sel("release"));
     delete k;
