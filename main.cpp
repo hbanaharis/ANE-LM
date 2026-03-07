@@ -60,7 +60,9 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  --repeat-penalty P Repetition penalty (default: 1.2, 1.0=off)\n");
     fprintf(stderr, "  --enable-thinking Enable thinking/reasoning mode\n");
     fprintf(stderr, "  --backend <name>  Compute backend: ane (default) or coreml\n");
+    fprintf(stderr, "  --coreml-dir <p>  Override CoreML model directory (default: <model>-coreml)\n");
     fprintf(stderr, "  --timing          Print per-layer timing breakdown after generation\n");
+    fprintf(stderr, "  --mtp-test        Test MTP draft prediction accuracy (generate only)\n");
     fprintf(stderr, "  --no-ane-cache    Disable persistent ANE compile cache\n");
     fprintf(stderr, "  -v, --verbose     Show detailed initialization info\n");
     fprintf(stderr, "\nExamples:\n");
@@ -74,12 +76,14 @@ struct Args {
     const char* prompt = "Hello";
     const char* socket_path = nullptr;
     const char* backend = "ane";
+    const char* coreml_dir = nullptr;
     float temperature = 0.6f;
     int max_tokens = 0;
     float repetition_penalty = 1.2f;
     bool ane_cache = true;
     bool enable_thinking = false;
     bool timing = false;
+    bool mtp_test = false;
 };
 
 static Args parse_args(int argc, char* argv[], int start) {
@@ -97,12 +101,16 @@ static Args parse_args(int argc, char* argv[], int start) {
             args.repetition_penalty = atof(argv[++i]);
         } else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
             args.backend = argv[++i];
+        } else if (strcmp(argv[i], "--coreml-dir") == 0 && i + 1 < argc) {
+            args.coreml_dir = argv[++i];
         } else if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc) {
             args.socket_path = argv[++i];
         } else if (strcmp(argv[i], "--enable-thinking") == 0) {
             args.enable_thinking = true;
         } else if (strcmp(argv[i], "--timing") == 0) {
             args.timing = true;
+        } else if (strcmp(argv[i], "--mtp-test") == 0) {
+            args.mtp_test = true;
         } else if (strcmp(argv[i], "--no-ane-cache") == 0) {
             args.ane_cache = false;
         } else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
@@ -135,13 +143,21 @@ static int cmd_generate(LLMModel& model, Tokenizer& tokenizer, const Args& args)
                 fprintf(stderr, "%s", r.text.c_str());
             }
             last = r;
-        });
+        },
+        args.mtp_test);
 
     fprintf(stderr, "\n==========\n");
     fprintf(stderr, "Prompt: %d tokens, %.3f tokens-per-sec\n",
             last.prompt_tokens, last.prompt_tps);
     fprintf(stderr, "Generation: %d tokens, %.3f tokens-per-sec\n",
             last.generation_tokens, last.generation_tps);
+    if (args.mtp_test && last.mtp_total > 0) {
+        fprintf(stderr, "MTP: %d/%d correct (%.1f%% acceptance rate)\n",
+                last.mtp_correct, last.mtp_total,
+                100.0 * last.mtp_correct / last.mtp_total);
+    } else if (args.mtp_test) {
+        fprintf(stderr, "MTP: no predictions (model may not have MTP weights)\n");
+    }
 
     if (args.timing) model.print_timing();
     return 0;
@@ -471,7 +487,8 @@ int main(int argc, char* argv[]) {
     std::unique_ptr<LLMModel> model;
     Tokenizer tokenizer;
     try {
-        auto result = load(args.model_dir, args.ane_cache, std::string(args.backend));
+        auto result = load(args.model_dir, args.ane_cache, std::string(args.backend),
+                           args.coreml_dir ? std::string(args.coreml_dir) : std::string());
         model = std::move(result.first);
         tokenizer = std::move(result.second);
     } catch (const std::exception& e) {

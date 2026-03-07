@@ -23,6 +23,15 @@ bool coreml_predict(CoreMLKernel* k, float* output, const float* input,
 // Free a CoreML kernel
 void coreml_free(CoreMLKernel* k);
 
+// Initialize batch support (pre-allocate arrays for batch sizes 1,2,4,8)
+// Call after coreml_load() for models that support batched prefill
+bool coreml_init_batch(CoreMLKernel* k, int max_batch = 8);
+
+// Run batched prediction: [batch_size, in_dim] → [batch_size, out_dim]
+// Input/output are contiguous FP32 arrays of size batch_size * dim
+bool coreml_predict_batch(CoreMLKernel* k, float* output, const float* input,
+                           int in_dim, int out_dim, int batch_size);
+
 // Load a 2-input CoreML model (e.g. fused post_attn)
 CoreMLKernel2* coreml_load_2input(const std::string& model_path,
                                     int in1_dim, int in2_dim, int out_dim,

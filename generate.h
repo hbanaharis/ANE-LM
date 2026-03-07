@@ -17,6 +17,8 @@ struct GenerationResponse {
     double prompt_tps = 0.0;
     int generation_tokens = 0;
     double generation_tps = 0.0;
+    int mtp_correct = 0;
+    int mtp_total = 0;
 };
 
 // Multi-turn: accepts full message history
@@ -27,7 +29,8 @@ void stream_generate(
     int max_tokens = 0,
     bool enable_thinking = false,
     const SamplingParams& sampling = {},
-    std::function<void(const GenerationResponse&)> callback = nullptr);
+    std::function<void(const GenerationResponse&)> callback = nullptr,
+    bool mtp_test = false);
 
 // Single-prompt convenience overload
 void stream_generate(
@@ -37,6 +40,7 @@ void stream_generate(
     int max_tokens = 0,
     bool enable_thinking = false,
     const SamplingParams& sampling = {},
-    std::function<void(const GenerationResponse&)> callback = nullptr);
+    std::function<void(const GenerationResponse&)> callback = nullptr,
+    bool mtp_test = false);
 
 } // namespace ane_lm

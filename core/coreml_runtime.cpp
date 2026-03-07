@@ -39,21 +39,29 @@ static id ns_number_int(int v) {
 
 struct CoreMLKernel {
     id model;           // MLModel*
-    id inputArray;      // MLMultiArray* (pre-allocated, reused)
-    id provider;        // MLDictionaryFeatureProvider* (cached, reused)
+    id inputArray;      // MLMultiArray* (pre-allocated, reused) — single-token
+    id provider;        // MLDictionaryFeatureProvider* (cached, reused) — single-token
     id outputFeature;   // Cached output feature name (NSString*)
+    id inputName;       // Retained input feature name (NSString*)
     int in_dim;
     int out_dim;
+    bool input_fp16;    // Whether input MLMultiArray is FP16
     bool output_fp16;   // Whether output MLMultiArray is FP16
+
+    // Batch support (initialized by coreml_init_batch)
+    static constexpr int MAX_BATCH_IDX = 4;
+    int max_batch = 0;                          // 0 = batch not initialized
+    id batchArrays[MAX_BATCH_IDX] = {};         // [1,dim], [2,dim], [4,dim], [8,dim]
+    id batchProviders[MAX_BATCH_IDX] = {};      // corresponding providers
 };
 
 // ============ MLMultiArray helpers ============
 
-// Create an MLMultiArray with shape [1, dim]
-static id create_multi_array(int dim, long dataType = kMLDataTypeFloat32) {
+// Create an MLMultiArray with shape [rows, dim]
+static id create_multi_array(int dim, long dataType = kMLDataTypeFloat32, int rows = 1) {
     id shape = ((id(*)(Class,SEL,unsigned long))objc_msgSend)(
         cls("NSMutableArray"), sel("arrayWithCapacity:"), (unsigned long)2);
-    ((void(*)(id,SEL,id))objc_msgSend)(shape, sel("addObject:"), ns_number_int(1));
+    ((void(*)(id,SEL,id))objc_msgSend)(shape, sel("addObject:"), ns_number_int(rows));
     ((void(*)(id,SEL,id))objc_msgSend)(shape, sel("addObject:"), ns_number_int(dim));
 
     id err = nil;
@@ -235,8 +243,14 @@ CoreMLKernel* coreml_load(const std::string& model_path, int in_dim, int out_dim
     id inputName = ((id(*)(id,SEL,unsigned long))objc_msgSend)(inputKeys, sel("objectAtIndex:"), 0UL);
     id outputName = ((id(*)(id,SEL,unsigned long))objc_msgSend)(outputKeys, sel("objectAtIndex:"), 0UL);
 
-    // Pre-allocate input MLMultiArray
-    id inputArray = create_multi_array(in_dim);
+    // Probe input data type from model description
+    id inputDescObj = ((id(*)(id,SEL,id))objc_msgSend)(inputDescs, sel("objectForKey:"), inputName);
+    id constraint = ((id(*)(id,SEL))objc_msgSend)(inputDescObj, sel("multiArrayConstraint"));
+    long inputDataType = ((long(*)(id,SEL))objc_msgSend)(constraint, sel("dataType"));
+    bool input_fp16 = (inputDataType == kMLDataTypeFloat16);
+
+    // Pre-allocate input MLMultiArray (matching model's expected type)
+    id inputArray = create_multi_array(in_dim, input_fp16 ? kMLDataTypeFloat16 : kMLDataTypeFloat32);
     if (!inputArray) {
         ((void(*)(id,SEL))objc_msgSend)(model, sel("release"));
         objc_autoreleasePoolPop(pool);
@@ -297,9 +311,13 @@ CoreMLKernel* coreml_load(const std::string& model_path, int in_dim, int out_dim
     k->inputArray = inputArray;
     k->provider = provider;
     k->outputFeature = outputName;
+    k->inputName = inputName;
+    ((id(*)(id,SEL))objc_msgSend)(inputName, sel("retain"));
     k->in_dim = in_dim;
     k->out_dim = out_dim;
+    k->input_fp16 = input_fp16;
     k->output_fp16 = output_fp16;
+    k->max_batch = 0;
 
     objc_autoreleasePoolPop(pool);
     return k;
@@ -309,9 +327,17 @@ bool coreml_predict(CoreMLKernel* k, float* output, const float* input,
                      int in_dim, int out_dim) {
     void* pool = objc_autoreleasePoolPush();
 
-    // Copy input data to pre-allocated MLMultiArray (FP32)
-    float* in_ptr = (float*)multi_array_data_ptr(k->inputArray);
-    memcpy(in_ptr, input, in_dim * sizeof(float));
+    // Copy input data to pre-allocated MLMultiArray
+    if (k->input_fp16) {
+        // Convert FP32 → FP16 via Accelerate
+        void* in_ptr = multi_array_data_ptr(k->inputArray);
+        vImage_Buffer src = { (void*)input, 1, (unsigned long)in_dim, (unsigned long)(in_dim * sizeof(float)) };
+        vImage_Buffer dst = { in_ptr,       1, (unsigned long)in_dim, (unsigned long)(in_dim * sizeof(uint16_t)) };
+        vImageConvert_PlanarFtoPlanar16F(&src, &dst, 0);
+    } else {
+        float* in_ptr = (float*)multi_array_data_ptr(k->inputArray);
+        memcpy(in_ptr, input, in_dim * sizeof(float));
+    }
 
     // Run prediction using cached provider
     id err = nil;
@@ -354,8 +380,163 @@ void coreml_free(CoreMLKernel* k) {
     ((void(*)(id,SEL))objc_msgSend)(k->provider, sel("release"));
     ((void(*)(id,SEL))objc_msgSend)(k->inputArray, sel("release"));
     ((void(*)(id,SEL))objc_msgSend)(k->outputFeature, sel("release"));
+    ((void(*)(id,SEL))objc_msgSend)(k->inputName, sel("release"));
+    // Free batch arrays/providers
+    for (int i = 0; i < CoreMLKernel::MAX_BATCH_IDX; i++) {
+        if (k->batchArrays[i])
+            ((void(*)(id,SEL))objc_msgSend)(k->batchArrays[i], sel("release"));
+        if (k->batchProviders[i])
+            ((void(*)(id,SEL))objc_msgSend)(k->batchProviders[i], sel("release"));
+    }
     ((void(*)(id,SEL))objc_msgSend)(k->model, sel("release"));
     delete k;
+}
+
+// ============ Batch CoreML API ============
+
+static constexpr int BATCH_SIZES[] = {1, 2, 4, 8};
+
+static int batch_index(int batch_size) {
+    for (int i = 0; i < CoreMLKernel::MAX_BATCH_IDX; i++) {
+        if (BATCH_SIZES[i] == batch_size) return i;
+    }
+    return -1;
+}
+
+bool coreml_init_batch(CoreMLKernel* k, int max_batch) {
+    void* pool = objc_autoreleasePoolPush();
+
+    long dtype = k->input_fp16 ? kMLDataTypeFloat16 : kMLDataTypeFloat32;
+    k->max_batch = max_batch;
+
+    for (int i = 0; i < CoreMLKernel::MAX_BATCH_IDX; i++) {
+        int b = BATCH_SIZES[i];
+        if (b > max_batch) break;
+
+        // Create [b, in_dim] MLMultiArray
+        id array = create_multi_array(k->in_dim, dtype, b);
+        if (!array) {
+            fprintf(stderr, "[CoreML] Failed to create batch array size %d\n", b);
+            objc_autoreleasePoolPop(pool);
+            return false;
+        }
+        ((id(*)(id,SEL))objc_msgSend)(array, sel("retain"));
+
+        // Wrap in feature provider
+        id featureValue = ((id(*)(Class,SEL,id))objc_msgSend)(
+            cls("MLFeatureValue"), sel("featureValueWithMultiArray:"), array);
+        ((id(*)(id,SEL))objc_msgSend)(featureValue, sel("retain"));
+
+        id fKeys[] = { k->inputName };
+        id fValues[] = { featureValue };
+        id dict = ((id(*)(Class,SEL,id*,id*,unsigned long))objc_msgSend)(
+            cls("NSDictionary"), sel("dictionaryWithObjects:forKeys:count:"),
+            fValues, fKeys, 1UL);
+
+        id err = nil;
+        id provider = ((id(*)(id,SEL,id,id*))objc_msgSend)(
+            ((id(*)(Class,SEL))objc_msgSend)(cls("MLDictionaryFeatureProvider"), sel("alloc")),
+            sel("initWithDictionary:error:"),
+            dict, &err);
+        if (err || !provider) {
+            fprintf(stderr, "[CoreML] Failed to create batch provider for size %d\n", b);
+            ((void(*)(id,SEL))objc_msgSend)(featureValue, sel("release"));
+            ((void(*)(id,SEL))objc_msgSend)(array, sel("release"));
+            objc_autoreleasePoolPop(pool);
+            return false;
+        }
+        ((id(*)(id,SEL))objc_msgSend)(provider, sel("retain"));
+        ((void(*)(id,SEL))objc_msgSend)(featureValue, sel("release"));
+
+        k->batchArrays[i] = array;
+        k->batchProviders[i] = provider;
+    }
+
+    // Probe: verify model supports batch shapes by doing a test prediction with batch=2
+    if (max_batch >= 2 && k->batchProviders[1]) {
+        id probeErr = nil;
+        id probeResult = ((id(*)(id,SEL,id,id*))objc_msgSend)(
+            k->model, sel("predictionFromFeatures:error:"),
+            k->batchProviders[1], &probeErr);
+        if (!probeResult) {
+            // Model doesn't support batch — clean up and disable
+            for (int i = 0; i < CoreMLKernel::MAX_BATCH_IDX; i++) {
+                if (k->batchArrays[i]) {
+                    ((void(*)(id,SEL))objc_msgSend)(k->batchArrays[i], sel("release"));
+                    k->batchArrays[i] = nil;
+                }
+                if (k->batchProviders[i]) {
+                    ((void(*)(id,SEL))objc_msgSend)(k->batchProviders[i], sel("release"));
+                    k->batchProviders[i] = nil;
+                }
+            }
+            k->max_batch = 0;
+            objc_autoreleasePoolPop(pool);
+            return false;
+        }
+    }
+
+    objc_autoreleasePoolPop(pool);
+    return true;
+}
+
+bool coreml_predict_batch(CoreMLKernel* k, float* output, const float* input,
+                           int in_dim, int out_dim, int batch_size) {
+    int idx = batch_index(batch_size);
+    if (idx < 0 || !k->batchArrays[idx]) {
+        fprintf(stderr, "[CoreML] Batch size %d not initialized\n", batch_size);
+        return false;
+    }
+
+    void* pool = objc_autoreleasePoolPush();
+
+    int total_in = batch_size * in_dim;
+    int total_out = batch_size * out_dim;
+
+    // Copy input data to batch MLMultiArray
+    if (k->input_fp16) {
+        void* in_ptr = multi_array_data_ptr(k->batchArrays[idx]);
+        vImage_Buffer src = { (void*)input, 1, (unsigned long)total_in, (unsigned long)(total_in * sizeof(float)) };
+        vImage_Buffer dst = { in_ptr,       1, (unsigned long)total_in, (unsigned long)(total_in * sizeof(uint16_t)) };
+        vImageConvert_PlanarFtoPlanar16F(&src, &dst, 0);
+    } else {
+        float* in_ptr = (float*)multi_array_data_ptr(k->batchArrays[idx]);
+        memcpy(in_ptr, input, total_in * sizeof(float));
+    }
+
+    // Run prediction
+    id err = nil;
+    id result = ((id(*)(id,SEL,id,id*))objc_msgSend)(
+        k->model, sel("predictionFromFeatures:error:"),
+        k->batchProviders[idx], &err);
+
+    if (!result) {
+        if (err) {
+            const char* desc = ((const char*(*)(id,SEL))objc_msgSend)(
+                ((id(*)(id,SEL))objc_msgSend)(err, sel("localizedDescription")),
+                sel("UTF8String"));
+            fprintf(stderr, "[CoreML] Batch prediction failed (batch=%d): %s\n", batch_size, desc);
+        }
+        objc_autoreleasePoolPop(pool);
+        return false;
+    }
+
+    // Extract output
+    id outFeature = ((id(*)(id,SEL,id))objc_msgSend)(
+        result, sel("featureValueForName:"), k->outputFeature);
+    id outArray = ((id(*)(id,SEL))objc_msgSend)(outFeature, sel("multiArrayValue"));
+    void* out_ptr = multi_array_data_ptr(outArray);
+
+    if (k->output_fp16) {
+        vImage_Buffer src = { out_ptr, 1, (unsigned long)total_out, (unsigned long)(total_out * 2) };
+        vImage_Buffer dst = { output,  1, (unsigned long)total_out, (unsigned long)(total_out * 4) };
+        vImageConvert_Planar16FtoPlanarF(&src, &dst, 0);
+    } else {
+        memcpy(output, out_ptr, total_out * sizeof(float));
+    }
+
+    objc_autoreleasePoolPop(pool);
+    return true;
 }
 
 // ============ 2-Input CoreML API ============

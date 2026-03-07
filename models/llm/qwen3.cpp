@@ -131,7 +131,8 @@ void Qwen3Model::apply_args(const Qwen3Args& args) {
     full_out_dim_ = q_proj_dim_;
 }
 
-bool Qwen3Model::load(const std::string& model_dir, const std::string& /*backend*/) {
+bool Qwen3Model::load(const std::string& model_dir, const std::string& /*backend*/,
+                      const std::string& /*coreml_dir*/) {
     // 1. Read config.json and parse args
     std::string config_path = model_dir + "/config.json";
     std::ifstream f(config_path);

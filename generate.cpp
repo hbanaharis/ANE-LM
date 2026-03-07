@@ -34,7 +34,8 @@ void stream_generate(
     int max_tokens,
     bool enable_thinking,
     const SamplingParams& sampling,
-    std::function<void(const GenerationResponse&)> callback)
+    std::function<void(const GenerationResponse&)> callback,
+    bool mtp_test)
 {
     // Tokenize with chat template
     std::vector<int> prompt_tokens;
@@ -53,11 +54,32 @@ void stream_generate(
     // Prefill
     Timer prefill_timer;
     float* logits = nullptr;
-    for (int i = 0; i < (int)prompt_tokens.size(); i++) {
-        logits = model.forward(prompt_tokens[i], i);
-        if (!logits) {
-            fprintf(stderr, "Forward failed during prefill at token index %d\n", i);
-            return;
+    if (model.has_batch_prefill()) {
+        // Batched prefill: process tokens in chunks of 8/4/2/1
+        static constexpr int batch_sizes[] = {8, 4, 2, 1};
+        int i = 0;
+        while (i < (int)prompt_tokens.size()) {
+            int remaining = (int)prompt_tokens.size() - i;
+            int batch = 1;
+            for (int b : batch_sizes) {
+                if (b <= remaining) { batch = b; break; }
+            }
+            logits = model.forward_batch(prompt_tokens.data() + i, batch, i);
+            if (!logits) {
+                fprintf(stderr, "Batch forward failed during prefill at token %d\n", i);
+                return;
+            }
+            i += batch;
+        }
+    } else {
+        // Single-token prefill (skip LM head except on last token)
+        for (int i = 0; i < (int)prompt_tokens.size(); i++) {
+            bool last = (i == (int)prompt_tokens.size() - 1);
+            logits = model.forward(prompt_tokens[i], i, last);
+            if (!logits) {
+                fprintf(stderr, "Forward failed during prefill at token index %d\n", i);
+                return;
+            }
         }
     }
     double prefill_ms = prefill_timer.elapsed_ms();
@@ -78,6 +100,11 @@ void stream_generate(
     std::string prev_decoded;
     bool has_prev_decoded = false;
     int next_token = sample_token(logits, sampler_vocab, sampling, generated_tokens);
+
+    // MTP test state
+    bool do_mtp = mtp_test && model.has_mtp();
+    int mtp_draft = -1;
+    int mtp_correct = 0, mtp_total = 0;
 
     int limit = (max_tokens > 0) ? max_tokens : INT_MAX;
     for (int i = 0; i < limit; i++) {
@@ -117,6 +144,8 @@ void stream_generate(
             r.prompt_tps = prompt_tps;
             r.generation_tokens = n_generated;
             r.generation_tps = n_generated / (gen_timer.elapsed_ms() / 1000.0);
+            r.mtp_correct = mtp_correct;
+            r.mtp_total = mtp_total;
             callback(r);
         }
 
@@ -127,6 +156,23 @@ void stream_generate(
             return;
         }
         next_token = sample_token(logits, sampler_vocab, sampling, generated_tokens);
+
+        // MTP: check previous draft, then predict next-next token
+        if (do_mtp) {
+            if (mtp_draft >= 0) {
+                mtp_total++;
+                if (mtp_draft == next_token) mtp_correct++;
+            }
+            // forward_mtp uses h_L from the forward() above and embed(next_token)
+            // to predict the token after next_token
+            float* mtp_logits = model.forward_mtp(next_token, pos + 1);
+            if (mtp_logits) {
+                mtp_draft = 0;
+                for (int v = 1; v < sampler_vocab; v++) {
+                    if (mtp_logits[v] > mtp_logits[mtp_draft]) mtp_draft = v;
+                }
+            }
+        }
     }
 
     // Flush any remaining tail at end.
@@ -151,6 +197,8 @@ void stream_generate(
             r.prompt_tps = prompt_tps;
             r.generation_tokens = n_generated;
             r.generation_tps = n_generated / (gen_timer.elapsed_ms() / 1000.0);
+            r.mtp_correct = mtp_correct;
+            r.mtp_total = mtp_total;
             callback(r);
         }
     }
@@ -163,6 +211,8 @@ void stream_generate(
         r.prompt_tps = prompt_tps;
         r.generation_tokens = n_generated;
         r.generation_tps = n_generated / (gen_timer.elapsed_ms() / 1000.0);
+        r.mtp_correct = mtp_correct;
+        r.mtp_total = mtp_total;
         callback(r);
     }
 }
@@ -175,12 +225,13 @@ void stream_generate(
     int max_tokens,
     bool enable_thinking,
     const SamplingParams& sampling,
-    std::function<void(const GenerationResponse&)> callback)
+    std::function<void(const GenerationResponse&)> callback,
+    bool mtp_test)
 {
     std::vector<std::pair<std::string, std::string>> messages = {
         {"user", prompt}
     };
-    stream_generate(model, tokenizer, messages, max_tokens, enable_thinking, sampling, std::move(callback));
+    stream_generate(model, tokenizer, messages, max_tokens, enable_thinking, sampling, std::move(callback), mtp_test);
 }
 
 } // namespace ane_lm

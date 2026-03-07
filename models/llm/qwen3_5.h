@@ -19,12 +19,32 @@ enum class LayerType {
 class LLMModel {
 public:
     virtual ~LLMModel() = default;
-    virtual bool load(const std::string& model_dir, const std::string& backend = "ane") = 0;
+    virtual bool load(const std::string& model_dir, const std::string& backend = "ane",
+                      const std::string& coreml_dir = "") = 0;
     virtual float* forward(int token_id, int pos) = 0;
+    virtual float* forward(int token_id, int pos, bool compute_logits) {
+        (void)compute_logits;
+        return forward(token_id, pos);  // default: always compute logits
+    }
     virtual void reset() = 0;
     virtual int vocab_size() const = 0;
     virtual void set_timing(bool enabled) { (void)enabled; }
     virtual void print_timing() {}
+    virtual bool has_mtp() const { return false; }
+    virtual float* forward_mtp(int draft_token, int pos) {
+        (void)draft_token; (void)pos; return nullptr;
+    }
+    virtual bool has_batch_prefill() const { return false; }
+    virtual float* forward_batch(const int* tokens, int n_tokens, int start_pos) {
+        // Default: single-token loop
+        float* logits = nullptr;
+        for (int i = 0; i < n_tokens; i++) {
+            bool last = (i == n_tokens - 1);
+            logits = forward(tokens[i], start_pos + i, last);
+            if (!logits) return nullptr;
+        }
+        return logits;
+    }
 };
 
 // Model-owned config (mirrors mlx-lm.cpp style)
@@ -63,12 +83,18 @@ struct Qwen35Args {
 class Qwen35Model : public LLMModel {
 public:
     ~Qwen35Model() override;
-    bool load(const std::string& model_dir, const std::string& backend = "ane") override;
+    bool load(const std::string& model_dir, const std::string& backend = "ane",
+             const std::string& coreml_dir = "") override;
     float* forward(int token_id, int pos) override;
+    float* forward(int token_id, int pos, bool compute_logits) override;
     void reset() override;
     int vocab_size() const override { return vocab_size_; }
     void set_timing(bool enabled) override { timing_enabled_ = enabled; }
     void print_timing() override;
+    bool has_mtp() const override { return mtp_loaded_; }
+    float* forward_mtp(int draft_token, int pos) override;
+    bool has_batch_prefill() const override { return batch_enabled_; }
+    float* forward_batch(const int* tokens, int n_tokens, int start_pos) override;
 
 private:
     // Config
@@ -99,6 +125,7 @@ private:
     static constexpr int MAX_SEQ_LEN = 4096;
     static constexpr int KV_CACHE_CAPACITY = 2048;
     static constexpr int LM_HEAD_ANE_CHUNK_MAX = 262144;
+    static constexpr int MAX_PREFILL_BATCH = 8;
 
     std::vector<LayerType> layer_types_;
 
@@ -154,11 +181,14 @@ private:
 
     // CoreML backend
     bool use_coreml_ = false;
+    bool norm_fused_mode_ = false;  // true if norm is fused into projections
     struct LayerCoreMLKernels {
-        CoreMLKernel* first_proj = nullptr;
-        CoreMLKernel* o_proj = nullptr;       // legacy (non-fused)
-        CoreMLKernel* fused_ffn = nullptr;    // legacy (non-fused)
-        CoreMLKernel2* post_attn = nullptr;   // fused: o_proj + residual + norm + FFN + residual
+        CoreMLKernel* first_proj = nullptr;   // legacy or norm-fused (norm + QKV + in_proj_a/b)
+        CoreMLKernel* o_proj = nullptr;
+        CoreMLKernel* fused_ffn = nullptr;    // legacy only (no norm)
+        CoreMLKernel* norm_fused_ffn = nullptr; // norm-fused only (norm + FFN)
+        CoreMLKernel2* post_attn = nullptr;   // experimental (kept for compat)
+        bool norm_fused = false;              // per-layer flag
     };
     std::vector<LayerCoreMLKernels> coreml_layers_;
     std::vector<CoreMLKernel*> coreml_lm_head_;
@@ -180,6 +210,35 @@ private:
     float* rope_cos_ = nullptr;
     float* rope_sin_ = nullptr;
 
+    // Batch prefill buffers
+    float* x_batch_ = nullptr;     // [MAX_PREFILL_BATCH * hidden_size]
+    float* proj_batch_ = nullptr;  // [MAX_PREFILL_BATCH * max_proj_dim]
+    float* core_batch_ = nullptr;  // [MAX_PREFILL_BATCH * max_core_dim]
+    bool batch_enabled_ = false;
+
+    // MTP (Multi-Token Prediction) weights and state
+    struct MTPWeights {
+        float* pre_fc_norm_hidden = nullptr;
+        float* pre_fc_norm_embedding = nullptr;
+        float* fc = nullptr;              // [hidden_size, 2*hidden_size]
+        float* q_proj = nullptr;          // [q_dim, hidden_size]
+        float* k_proj = nullptr;          // [kv_dim, hidden_size]
+        float* v_proj = nullptr;          // [kv_dim, hidden_size]
+        float* o_proj = nullptr;          // [hidden_size, q_dim]
+        float* q_norm = nullptr;          // [head_dim]
+        float* k_norm = nullptr;          // [head_dim]
+        float* input_layernorm = nullptr; // [hidden_size]
+        float* post_attn_layernorm = nullptr; // [hidden_size]
+        float* gate_proj = nullptr;       // [intermediate, hidden_size]
+        float* up_proj = nullptr;         // [intermediate, hidden_size]
+        float* down_proj = nullptr;       // [hidden_size, intermediate]
+        float* norm = nullptr;            // [hidden_size] final norm
+    };
+    MTPWeights mtp_;
+    KVCache mtp_kv_cache_;
+    bool mtp_loaded_ = false;
+    float* pre_final_x_ = nullptr;  // hidden state before final_norm (saved for MTP)
+
     void apply_args(const Qwen35Args& args);
     bool detect_weight_prefix(ModelWeights* sf);
     bool load_weights(ModelWeights* sf);
@@ -196,8 +255,12 @@ private:
     static constexpr int OP_O_PROJ = 1;
     static constexpr int OP_FUSED_FFN = 2;
 
-    bool forward_deltanet_core(int L, float* x, float* pre_oproj);
+    bool load_mtp_weights(ModelWeights* sf);
+
+    bool forward_deltanet_core(int L, float* x, float* pre_oproj, bool norm_fused = false);
+    bool forward_deltanet_from_proj(int L, float* proj_output, float* pre_oproj, bool norm_fused);
     bool forward_full_attn_core(int L, float* x, float* pre_oproj, int pos);
+    bool forward_full_attn_from_proj(int L, float* proj_output, float* pre_oproj, int pos);
 
     // Per-layer timing
     bool timing_enabled_ = false;

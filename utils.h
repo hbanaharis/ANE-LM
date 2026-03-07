@@ -11,6 +11,7 @@ namespace ane_lm {
 
 std::pair<std::unique_ptr<LLMModel>, Tokenizer> load(
     const std::string& model_dir, bool ane_cache = true,
-    const std::string& backend = "ane");
+    const std::string& backend = "ane",
+    const std::string& coreml_dir = "");
 
 } // namespace ane_lm
