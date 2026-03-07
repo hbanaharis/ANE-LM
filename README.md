@@ -108,12 +108,14 @@ Download a supported model (e.g. `Qwen3-0.6B` or `Qwen3.5-0.8B` in BF16 safetens
 
 ### Performance
 
-| Model | Size | tok/s | Init (cached) |
-|-------|------|-------|---------------|
-| Qwen3.5-0.8B | 1.7 GB | 27 | 1.9s |
-| Qwen3.5-4B | 9.3 GB | 8.9 | 8.4s |
+| Model | Backend | Size | tok/s |
+|-------|---------|------|-------|
+| Qwen3.5-0.8B | CoreML per-layer | 356 MB (LUT6) | **47** |
+| Qwen3.5-4B | Hybrid chunked | 2.7 GB (LUT6) | **21** |
+| Qwen3.5-0.8B | Private ANE | 1.7 GB (FP16) | 27 |
+| Qwen3.5-4B | Private ANE | 9.3 GB (FP16) | 8.9 |
 
-ANE runs FP16-only (no quantization in private API). Throughput scales with model compute. The ANE operates independently from the GPU, enabling concurrent inference with GPU-based models (e.g. MLX).
+The **hybrid pipeline** fuses groups of layers into large CoreML chunks running on ANE, with CPU handling only the full attention core — 8 cross-device boundaries vs 96+ in per-layer. LUT6 quantization reduces model size by ~3.5×. The ANE operates independently from the GPU, enabling concurrent inference with GPU-based models (e.g. MLX).
 
 ## Requirements
 
