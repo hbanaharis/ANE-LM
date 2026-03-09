@@ -49,7 +49,7 @@ The daemon mode keeps the model resident on ANE, providing ~1–2s latency for u
 | Model | Backend | Size | tok/s |
 |-------|---------|------|-------|
 | Qwen3.5-0.8B | CoreML hybrid | 356 MB (LUT6) | **47** |
-| Qwen3.5-4B | CoreML hybrid | 2.9 GB (LUT6) | **21** |
+| Qwen3.5-4B | CoreML hybrid | 2.9 GB (LUT6) | **18** |
 | Qwen3.5-0.8B | Private ANE | 1.7 GB (FP16) | 27 |
 | Qwen3.5-4B | Private ANE | 9.3 GB (FP16) | 8.9 |
 
