@@ -45,15 +45,22 @@ LUT6_CONFIG = OptimizationConfig(global_config=OpPalettizerConfig(nbits=6))
 # ============ Components ============
 
 class RMSNorm(nn.Module):
-    """Qwen3_5-style RMSNorm: weight applied as (1 + weight), initialized to zeros."""
+    """Qwen3_5-style RMSNorm: weight applied as (1 + weight), initialized to zeros.
+    Uses [x, -x] → LayerNorm trick so CoreML maps it to ANE's native LayerNorm HW.
+    See: https://huggingface.co/blog/anemll/anemll-style-rms-ane
+    """
     def __init__(self, dim, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(dim))
         self.eps = eps
 
     def forward(self, x):
-        var = x.pow(2).mean(-1, keepdim=True)
-        return x * torch.rsqrt(var + self.eps) * (1.0 + self.weight)
+        # Concatenate [x, -x] → symmetric around zero → mean=0
+        # LayerNorm on symmetric input ≡ RMSNorm
+        doubled = torch.cat([x, -x], dim=-1)
+        normed = F.layer_norm(doubled, [doubled.shape[-1]], eps=self.eps)
+        # Take first half = x / RMS(x)
+        return normed[..., :x.shape[-1]] * (1.0 + self.weight)
 
 
 class SwiGLUFFN(nn.Module):
@@ -139,8 +146,10 @@ class DeltaNetLayer(nn.Module):
         new_ssm_state = decayed_state + outer
         y = torch.einsum('hkv,hk->hv', new_ssm_state, q)
 
-        var = y.pow(2).mean(dim=-1, keepdim=True)
-        y_norm = y * torch.rsqrt(var + 1e-6) * self.norm_weight.unsqueeze(0)
+        # Per-head RMSNorm via [y, -y] → LayerNorm trick (ANE-native)
+        doubled_y = torch.cat([y, -y], dim=-1)
+        normed_y = F.layer_norm(doubled_y, [doubled_y.shape[-1]], eps=1e-6)
+        y_norm = normed_y[..., :y.shape[-1]] * self.norm_weight.unsqueeze(0)
         z_reshaped = z.view(self.lin_num_val_heads, self.lin_val_dim)
         y_normed = (y_norm * F.silu(z_reshaped)).reshape(-1)
 
@@ -168,9 +177,11 @@ class PreAttnQKV(nn.Module):
         self.k_norm = nn.Parameter(torch.zeros(head_dim))
 
     def _per_head_rmsnorm(self, x, weight):
-        """Qwen3_5-style per-head RMSNorm: (1 + weight)."""
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        return x * torch.rsqrt(var + 1e-6) * (1.0 + weight).unsqueeze(0)
+        """Qwen3_5-style per-head RMSNorm: (1 + weight).
+        Uses [x, -x] → LayerNorm trick for ANE-native execution."""
+        doubled = torch.cat([x, -x], dim=-1)
+        normed = F.layer_norm(doubled, [doubled.shape[-1]], eps=1e-6)
+        return normed[..., :x.shape[-1]] * (1.0 + weight).unsqueeze(0)
 
     def forward(self, x):
         """Returns q_gate [num_heads, head_dim*2], k [kv_heads, head_dim], v [kv_heads, head_dim]."""
@@ -395,11 +406,28 @@ def load_post_attn(handles, weight_map, prefix, layer_idx, config):
     return mod
 
 
+class LMHeadArgmax(nn.Module):
+    """LM head with in-model top-k: returns (top_k_indices, top_k_logits) instead of full vocab logits.
+    Reduces ANE→CPU data transfer from 248K floats to 2*top_k values.
+    Inspired by ANEMLL's in-model argmax approach."""
+    def __init__(self, hidden_size, vocab_size, topk=32):
+        super().__init__()
+        self.proj = nn.Linear(hidden_size, vocab_size, bias=False)
+        self.topk = topk
+
+    def forward(self, x):
+        logits = self.proj(x)  # [1, vocab_size]
+        values, indices = torch.topk(logits, self.topk, dim=-1)  # [1, topk] each
+        return values, indices.to(torch.float32)  # CoreML needs float for indices
+
+
 def main():
     parser = argparse.ArgumentParser(description="Export hybrid ANE/CPU decode chunks")
     parser.add_argument("--model", required=True, help="Path to model directory")
     parser.add_argument("--output", required=True, help="Output directory")
     parser.add_argument("--no-quantize", action="store_true", help="Skip LUT6 quantization")
+    parser.add_argument("--lm-head", action="store_true", help="Also export LM head with in-model argmax")
+    parser.add_argument("--topk", type=int, default=32, help="Top-K for in-model argmax LM head (default: 32)")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -648,6 +676,61 @@ def main():
         m.predict(inp)
     avg_ms = (time.perf_counter() - t0) / N_BENCH * 1000
     print(f"  Benchmark: {avg_ms:.2f} ms")
+
+    # ==================== LM head with in-model argmax ====================
+    if args.lm_head:
+        vocab_size = tc["vocab_size"]
+        topk = args.topk
+        print(f"\n=== LM Head (in-model top-{topk} argmax): {hidden} → {vocab_size} ===")
+
+        tie = tc.get("tie_word_embeddings", False)
+        lm_key = f"{prefix}embed_tokens.weight" if tie else f"{prefix}lm_head.weight"
+        lm_w = get_tensor(handles, weight_map, lm_key)
+
+        lm_head = LMHeadArgmax(hidden, vocab_size, topk)
+        with torch.no_grad():
+            lm_head.proj.weight.copy_(lm_w)
+        lm_head.eval()
+
+        print("  Tracing...", end=" ", flush=True)
+        with torch.no_grad():
+            traced = torch.jit.trace(lm_head, (torch.randn(1, hidden),))
+        print("OK")
+
+        print("  Converting...", end=" ", flush=True)
+        lm_mlmodel = ct.convert(
+            traced,
+            inputs=[ct.TensorType(name="input", shape=(1, hidden), dtype=np.float16)],
+            outputs=[
+                ct.TensorType(name="top_logits", dtype=np.float16),
+                ct.TensorType(name="top_indices", dtype=np.float32),
+            ],
+            compute_precision=ct.precision.FLOAT16,
+            minimum_deployment_target=ct.target.macOS15,
+        )
+        print("OK")
+
+        if not args.no_quantize:
+            print("  LUT6...", end=" ", flush=True)
+            lm_mlmodel = palettize_weights(lm_mlmodel, LUT6_CONFIG)
+            print("OK")
+
+        lm_path = os.path.join(args.output, "lm_head_topk.mlpackage")
+        lm_mlmodel.save(lm_path)
+        size_mb = sum(os.path.getsize(os.path.join(dp, f))
+                      for dp, _, fns in os.walk(lm_path) for f in fns) / 1e6
+        print(f"  Saved: {lm_path} ({size_mb:.1f} MB)")
+
+        # Benchmark
+        m = ct.models.MLModel(lm_path, compute_units=ct.ComputeUnit.CPU_AND_NE)
+        inp = {"input": np.random.randn(1, hidden).astype(np.float16)}
+        for _ in range(5):
+            m.predict(inp)
+        t0 = time.perf_counter()
+        for _ in range(N_BENCH):
+            m.predict(inp)
+        avg_ms = (time.perf_counter() - t0) / N_BENCH * 1000
+        print(f"  Benchmark: {avg_ms:.2f} ms (was ~3.7ms returning full logits)")
 
     print(f"\n=== Summary ===")
     print(f"Total chunks: 1 first + {n_blocks-1} mid + 1 final = {n_blocks + 1}")

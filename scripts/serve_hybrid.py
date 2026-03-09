@@ -25,8 +25,9 @@ from transformers import AutoTokenizer
 # ============ Model Config ============
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models", "Qwen3.5-4B")
-HYBRID_DIR = os.path.join(os.path.dirname(__file__), "..", "models", "Qwen3.5-4B-hybrid")
+HYBRID_DIR = os.path.join(os.path.dirname(__file__), "..", "models", "Qwen3.5-4B-hybrid-v2")
 LM_HEAD_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "Qwen3.5-4B-coreml", "lm_head_chunk_0.mlpackage")
+LM_HEAD_TOPK_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "Qwen3.5-4B-hybrid-v2", "lm_head_topk.mlpackage")
 
 HIDDEN = 2560
 NUM_HEADS = 16
@@ -141,6 +142,7 @@ class HybridModel:
         self.mid_chunks = []
         self.final_chunk = None
         self.lm_head = None
+        self.lm_head_topk = False  # True if using in-model argmax variant
         self.stop_token_ids = set()
 
     def load(self):
@@ -209,10 +211,16 @@ class HybridModel:
             compute_units=compute_unit)
         print("  chunk_final loaded")
 
-        # LM head
+        # LM head — prefer top-k argmax variant (less data transfer)
         print("[Hybrid] Loading LM head...")
-        self.lm_head = ct.models.MLModel(LM_HEAD_PATH, compute_units=compute_unit)
-        print("  lm_head loaded")
+        if os.path.exists(LM_HEAD_TOPK_PATH):
+            self.lm_head = ct.models.MLModel(LM_HEAD_TOPK_PATH, compute_units=compute_unit)
+            self.lm_head_topk = True
+            print("  lm_head loaded (top-k argmax)")
+        else:
+            self.lm_head = ct.models.MLModel(LM_HEAD_PATH, compute_units=compute_unit)
+            self.lm_head_topk = False
+            print("  lm_head loaded (full logits)")
 
         elapsed = time.time() - t0
         print(f"[Hybrid] All models loaded in {elapsed:.1f}s")
@@ -273,25 +281,49 @@ class HybridModel:
     def _sample(self, hidden_states, temperature=0.0, top_p=0.9):
         """Run LM head and sample next token."""
         lm_out = self.lm_head.predict({"input": hidden_states})
-        logits = lm_out["output"].flatten().astype(np.float32)
 
-        if temperature <= 0:
-            return int(np.argmax(logits))
+        if self.lm_head_topk:
+            # In-model argmax: returns pre-computed top-k indices + logits
+            top_logits = lm_out["top_logits"].flatten().astype(np.float32)
+            top_indices = lm_out["top_indices"].flatten().astype(np.int64)
 
-        logits /= temperature
+            if temperature <= 0:
+                return int(top_indices[np.argmax(top_logits)])
 
-        # Top-p sampling
-        sorted_indices = np.argsort(logits)[::-1]
-        sorted_logits = logits[sorted_indices]
-        sorted_logits -= sorted_logits[0]  # stability
-        probs = np.exp(sorted_logits)
-        probs /= probs.sum()
-        cumulative = np.cumsum(probs)
-        cutoff = np.searchsorted(cumulative, top_p) + 1
-        top_indices = sorted_indices[:cutoff]
-        top_probs = probs[:cutoff]
-        top_probs /= top_probs.sum()
-        return int(np.random.choice(top_indices, p=top_probs))
+            top_logits /= temperature
+            top_logits -= top_logits[0]  # stability
+            probs = np.exp(top_logits)
+            probs /= probs.sum()
+
+            # Top-p within the top-k
+            sorted_order = np.argsort(probs)[::-1]
+            sorted_probs = probs[sorted_order]
+            cumulative = np.cumsum(sorted_probs)
+            cutoff = np.searchsorted(cumulative, top_p) + 1
+            sel = sorted_order[:cutoff]
+            sel_probs = probs[sel]
+            sel_probs /= sel_probs.sum()
+            chosen = np.random.choice(sel, p=sel_probs)
+            return int(top_indices[chosen])
+        else:
+            # Full logits path (legacy)
+            logits = lm_out["output"].flatten().astype(np.float32)
+
+            if temperature <= 0:
+                return int(np.argmax(logits))
+
+            logits /= temperature
+            sorted_indices = np.argsort(logits)[::-1]
+            sorted_logits = logits[sorted_indices]
+            sorted_logits -= sorted_logits[0]  # stability
+            probs = np.exp(sorted_logits)
+            probs /= probs.sum()
+            cumulative = np.cumsum(probs)
+            cutoff = np.searchsorted(cumulative, top_p) + 1
+            top_indices = sorted_indices[:cutoff]
+            top_probs = probs[:cutoff]
+            top_probs /= top_probs.sum()
+            return int(np.random.choice(top_indices, p=top_probs))
 
     def _chat_tokenize(self, messages, enable_thinking=True):
         """Tokenize chat messages using the chat template."""
@@ -306,12 +338,15 @@ class HybridModel:
 
     def generate(self, prompt: str, max_tokens: int = 256,
                  temperature: float = 0.0, top_p: float = 0.9,
-                 raw: bool = False, stream: bool = False):
+                 raw: bool = False, stream: bool = False,
+                 enable_thinking: bool = True):
         """Generate text. Returns generator if stream=True, else string."""
         if raw:
             input_ids = self.tokenizer.encode(prompt, add_special_tokens=True)
         else:
-            input_ids = self._chat_tokenize([{"role": "user", "content": prompt}])
+            input_ids = self._chat_tokenize(
+                [{"role": "user", "content": prompt}],
+                enable_thinking=enable_thinking)
 
         if len(input_ids) >= CONTEXT - 2:
             input_ids = input_ids[:CONTEXT - max_tokens - 2]
@@ -328,8 +363,10 @@ class HybridModel:
         conv_states, ssm_states, kv_caches = self._reset_state()
 
         # Prefill: process all prompt tokens
-        for pos, token_id in enumerate(input_ids):
-            x = self._embed(token_id)
+        # Batch embedding lookup (vectorized) then sequential decode
+        prefill_embeds = self.embed_weights[input_ids]  # [n_tokens, HIDDEN]
+        for pos in range(len(input_ids)):
+            x = prefill_embeds[pos:pos+1]  # [1, HIDDEN]
             hidden = self._decode_step(x, pos, conv_states, ssm_states, kv_caches)
 
         # Decode
@@ -583,8 +620,10 @@ def serve_socket(model: HybridModel, socket_path: str):
             temperature = req.get("temperature", 0.1)
 
             t0 = time.time()
+            # Use chat template with thinking disabled for utility tasks
             text = model.generate(prompt, max_tokens=max_tokens,
-                                  temperature=temperature, raw=True)
+                                  temperature=temperature, raw=False,
+                                  enable_thinking=False)
             elapsed = time.time() - t0
 
             # Count tokens in output
