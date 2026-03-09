@@ -46,12 +46,13 @@ The daemon mode keeps the model resident on ANE, providing ~1–2s latency for u
 
 ## Performance
 
-| Model | Backend | Size | tok/s |
-|-------|---------|------|-------|
-| Qwen3.5-0.8B | CoreML hybrid | 356 MB (LUT6) | **47** |
-| Qwen3.5-4B | CoreML hybrid | 2.9 GB (LUT6) | **18** |
-| Qwen3.5-0.8B | Private ANE | 1.7 GB (FP16) | 27 |
-| Qwen3.5-4B | Private ANE | 9.3 GB (FP16) | 8.9 |
+| Model | Backend | Size | tok/s | vs baseline |
+|-------|---------|------|-------|-------------|
+| Qwen3.5-0.8B | CoreML per-layer | 356 MB (LUT6) | **47** | +74% vs private ANE |
+| Qwen3.5-4B | CoreML hybrid v2 | 2.9 GB (LUT6) | **18** | +31% vs v1, +102% vs private ANE |
+| Qwen3.5-4B | CoreML hybrid v1 | 2.5 GB (LUT6) | 13.7 | +54% vs private ANE |
+| Qwen3.5-0.8B | Private ANE | 1.7 GB (FP16) | 27 | baseline |
+| Qwen3.5-4B | Private ANE | 9.3 GB (FP16) | 8.9 | baseline |
 
 The **hybrid pipeline** fuses groups of layers into large CoreML chunks running on ANE, with CPU handling only the full attention core — 8 cross-device boundaries vs 96+ in per-layer. LUT6 quantization reduces model size by ~3.5×. Key optimizations:
 - **ANE-native RMSNorm**: `[x, -x] → LayerNorm → slice` exploits ANE's dedicated LayerNorm hardware instead of manual `pow(2).mean().rsqrt()`
